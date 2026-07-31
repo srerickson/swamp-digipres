@@ -1,0 +1,214 @@
+# Hierarchical Listing of Semantic Units
+
+PREMIS Data Dictionary for Preservation Metadata, Version 3.0
+
+Each entry shows: **number** name *(Mandatory/Optional, Repeatable/Not Repeatable)* `[applicable types, if qualified]`.
+
+## 1. Object
+
+  - **1.1** objectIdentifier *(M, R)*
+    - **1.1.1** objectIdentifierType *(M, NR)*
+    - **1.1.2** objectIdentifierValue *(M, NR)*
+  - **1.2** objectCategory *(M, NR)*
+  - **1.3** preservationLevel *(O, R)* `[Intellectual Entity, Representation, File]`
+    - **1.3.1** preservationLevelType *(O, NR)* `[Intellectual Entity, Representation, File]`
+    - **1.3.2** preservationLevelValue *(M, NR)* `[Intellectual Entity, Representation, File]`
+    - **1.3.3** preservationLevelRole *(O, NR)* `[Intellectual Entity, Representation, File]`
+    - **1.3.4** preservationLevelRationale *(O, R)* `[Intellectual Entity, Representation, File]`
+    - **1.3.5** preservationLevelDateAssigned *(O, NR)* `[Intellectual Entity, Representation, File]`
+  - **1.4** significantProperties *(O, R)*
+    - **1.4.1** significantPropertiesType *(O, NR)*
+    - **1.4.2** significantPropertiesValue *(O, NR)*
+    - **1.4.3** significantPropertiesExtension *(O, R)*
+  - **1.5** objectCharacteristics *(M, R)* `[File, Bitstream]`
+    - **1.5.1** compositionLevel *(O, NR)* `[File, Bitstream]`
+    - **1.5.2** fixity *(O, R)* `[File, Bitstream]`
+      - **1.5.2.1** messageDigestAlgorithm *(M, NR)* `[File, Bitstream]`
+      - **1.5.2.2** messageDigest *(M, NR)* `[File, Bitstream]`
+      - **1.5.2.3** messageDigestOriginator *(O, NR)* `[File, Bitstream]`
+    - **1.5.3** size *(O, NR)* `[File, Bitstream]`
+    - **1.5.4** format *(M, R)* `[File, Bitstream]`
+      - **1.5.4.1** formatDesignation *(O, NR)* `[File, Bitstream]`
+        - **1.5.4.1.1** formatName *(M, NR)* `[File, Bitstream]`
+        - **1.5.4.1.2** formatVersion *(O, NR)* `[File, Bitstream]`
+      - **1.5.4.2** formatRegistry *(O, NR)* `[File, Bitstream]`
+        - **1.5.4.2.1** formatRegistryName *(M, NR)* `[File, Bitstream]`
+        - **1.5.4.2.2** formatRegistryKey *(M, NR)* `[File, Bitstream]`
+        - **1.5.4.2.3** formatRegistryRole *(O, NR)* `[File, Bitstream]`
+      - **1.5.4.3** formatNote *(O, R)* `[File, Bitstream]`
+    - **1.5.5** creatingApplication *(O, R)* `[File, Bitstream]`
+      - **1.5.5.1** creatingApplicationName *(O, NR)* `[File, Bitstream]`
+      - **1.5.5.2** creatingApplicationVersion *(O, NR)* `[File, Bitstream]`
+      - **1.5.5.3** dateCreatedByApplication *(O, NR)* `[File, Bitstream]`
+      - **1.5.5.4** creatingApplicationExtension *(O, R)* `[File, Bitstream]`
+    - **1.5.6** inhibitors *(O, R)* `[File, Bitstream]`
+      - **1.5.6.1** inhibitorType *(M, NR)* `[File, Bitstream]`
+      - **1.5.6.2** inhibitorTarget *(O, R)* `[File, Bitstream]`
+      - **1.5.6.3** inhibitorKey *(O, NR)* `[File, Bitstream]`
+    - **1.5.7** objectCharacteristicsExtension *(O, R)* `[File, Bitstream]`
+  - **1.6** originalName *(O, NR)* `[Intellectual Entity, Representation, File]`
+  - **1.7** storage *(O, R)* `[Representation, File, Bitstream]`
+    - **1.7.1** contentLocation *(O, NR)* `[Representation, File, Bitstream]`
+      - **1.7.1.1** contentLocationType *(M, NR)* `[Representation, File, Bitstream]`
+      - **1.7.1.2** contentLocationValue *(M, NR)* `[Representation, File, Bitstream]`
+    - **1.7.2** storageMedium *(O, NR)* `[Representation, File, Bitstream]`
+  - **1.8** signatureInformation *(O, R)* `[File, Bitstream]`
+    - **1.8.1** signature *(O, R)* `[File, Bitstream]`
+      - **1.8.1.1** signatureEncoding *(M, NR)* `[File, Bitstream]`
+      - **1.8.1.2** signer *(O, NR)* `[File, Bitstream]`
+      - **1.8.1.3** signatureMethod *(M, NR)* `[File, Bitstream]`
+      - **1.8.1.4** signatureValue *(M, NR)* `[File, Bitstream]`
+      - **1.8.1.5** signatureValidationRules *(M, NR)* `[File, Bitstream]`
+      - **1.8.1.6** signatureProperties *(O, R)* `[File, Bitstream]`
+      - **1.8.1.7** keyInformation *(O, NR)* `[File, Bitstream]`
+    - **1.8.2** signatureInformationExtension *(O, R)* `[File, Bitstream]`
+  - **1.9** environmentFunction *(O, R)* `[Intellectual Entity of type environment]`
+    - **1.9.1** environmentFunctionType *(M, NR)* `[Intellectual Entity of type environment]`
+    - **1.9.2** environmentFunctionLevel *(M, NR)* `[Intellectual Entity of type environment]`
+  - **1.10** environmentDesignation *(O, R)* `[Intellectual Entity of type environment]`
+    - **1.10.1** environmentName *(M, NR)* `[Intellectual Entity of type environment]`
+    - **1.10.2** environmentVersion *(O, NR)* `[Intellectual Entity of type environment]`
+    - **1.10.3** environmentOrigin *(O, NR)* `[Intellectual Entity of type environment]`
+    - **1.10.4** environmentDesignationNote *(O, R)* `[Intellectual Entity of type environment]`
+    - **1.10.5** environmentDesignationExtension *(O, R)* `[Intellectual Entity of type environment]`
+  - **1.11** environmentRegistry *(O, R)* `[Intellectual Entity of type environment]`
+    - **1.11.1** environmentRegistryName *(M, NR)* `[Intellectual Entity of type environment]`
+    - **1.11.2** environmentRegistryKey *(M, NR)* `[Intellectual Entity of type environment]`
+    - **1.11.3** environmentRegistryRole *(O, NR)* `[Intellectual Entity of type environment]`
+  - **1.12** environmentExtension *(O, R)* `[Intellectual Entity of type environment]`
+  - **1.13** relationship *(O, R)*
+    - **1.13.1** relationshipType *(M, NR)*
+    - **1.13.2** relationshipSubType *(M, NR)*
+    - **1.13.3** relatedObjectIdentifier *(M, R)*
+      - **1.13.3.1** relatedObjectIdentifierType *(M, NR)*
+      - **1.13.3.2** relatedObjectIdentifierValue *(M, NR)*
+      - **1.13.3.3** relatedObjectSequence *(O, NR)*
+    - **1.13.4** relatedEventIdentifier *(O, R)*
+      - **1.13.4.1** relatedEventIdentifierType *(M, NR)*
+      - **1.13.4.2** relatedEventIdentifierValue *(M, NR)*
+      - **1.13.4.3** relatedEventSequence *(O, NR)*
+    - **1.13.5** relatedEnvironmentPurpose *(O, R)* `[Representation, File, Bitstream]`
+    - **1.13.6** relatedEnvironmentCharacteristic *(O, NR)* `[Representation, File, Bitstream]`
+  - **1.14** linkingEventIdentifier *(O, R)*
+    - **1.14.1** linkingEventIdentifierType *(M, NR)*
+    - **1.14.2** linkingEventIdentifierValue *(M, NR)*
+  - **1.15** linkingRightsStatementIdentifier *(O, R)*
+    - **1.15.1** linkingRightsStatementIdentifierType *(M, NR)*
+    - **1.15.2** linkingRightsStatementIdentifierValue *(M, NR)*
+
+## Event
+
+  - **2.1** eventIdentifier *(M, NR)*
+    - **2.1.1** eventIdentifierType *(M, NR)*
+    - **2.1.2** eventIdentifierValue *(M, NR)*
+  - **2.2** eventType *(M, NR)*
+  - **2.3** eventDateTime *(M, NR)*
+  - **2.4** eventDetailInformation *(O, R)*
+    - **2.4.1** eventDetail *(O, NR)*
+    - **2.4.2** eventDetailExtension *(O, R)*
+  - **2.5** eventOutcomeInformation *(O, R)*
+    - **2.5.1** eventOutcome *(O, NR)*
+    - **2.5.2** eventOutcomeDetail *(O, R)*
+      - **2.5.2.1** eventOutcomeDetailNote *(O, NR)*
+      - **2.5.2.2** eventOutcomeDetailExtension *(O, R)*
+  - **2.6** linkingAgentIdentifier *(O, R)*
+    - **2.6.1** linkingAgentIdentifierType *(M, NR)*
+    - **2.6.2** linkingAgentIdentifierValue *(M, NR)*
+    - **2.6.3** linkingAgentRole *(O, R)*
+  - **2.7** linkingObjectIdentifier *(O, R)*
+    - **2.7.1** linkingObjectIdentifierType *(M, NR)*
+    - **2.7.2** linkingObjectIdentifierValue *(M, NR)*
+    - **2.7.3** linkingObjectRole *(O, R)*
+
+## Agent
+
+  - **3.1** agentIdentifier *(M, R)*
+    - **3.1.1** agentIdentifierType *(M, NR)*
+    - **3.1.2** agentIdentifierValue *(M, NR)*
+  - **3.2** agentName *(O, R)*
+  - **3.3** agentType *(O, NR)*
+  - **3.4** agentVersion *(O, NR)*
+  - **3.5** agentNote *(O, R)*
+  - **3.6** agentExtension *(O, R)*
+  - **3.7** linkingEventIdentifier *(O, R)*
+    - **3.7.1** linkingEventIdentifierType *(M, NR)*
+    - **3.7.2** linkingEventIdentifierValue *(M, NR)*
+  - **3.8** linkingRightsStatementIdentifier *(O, R)*
+    - **3.8.1** linkingRightsStatementIdentifierType *(M, NR)*
+    - **3.8.2** linkingRightsStatementIdentifierValue *(M, NR)*
+  - **3.9** linkingEnvironmentIdentifier *(O, R)*
+    - **3.9.1** linkingEnvironmentIdentifierType *(M, NR)*
+    - **3.9.2** linkingEnvironmentIdentifierValue *(M, NR)*
+    - **3.9.3** linkingEnvironmentRole *(O, R)*
+
+## Rights
+
+  - **4.1** rightsStatement *(O, R)*
+    - **4.1.1** rightsStatementIdentifier *(M, NR)*
+      - **4.1.1.1** rightsStatementIdentifierType *(M, NR)*
+      - **4.1.1.2** rightsStatementIdentifierValue *(M, NR)*
+    - **4.1.2** rightsBasis *(M, NR)*
+    - **4.1.3** copyrightInformation *(O, NR)*
+      - **4.1.3.1** copyrightStatus *(M, NR)*
+      - **4.1.3.2** copyrightJurisdiction *(M, NR)*
+      - **4.1.3.3** copyrightStatusDeterminationDate *(O, NR)*
+      - **4.1.3.4** copyrightNote *(O, R)*
+      - **4.1.3.5** copyrightDocumentationIdentifier *(O, R)*
+        - **4.1.3.5.1** copyrightDocumentationIdentifierType *(M, NR)*
+        - **4.1.3.5.2** copyrightDocumentationIdentifierValue *(M, NR)*
+        - **4.1.3.5.3** copyrightDocumentationRole *(O, NR)*
+      - **4.1.3.6** copyrightApplicableDates *(O, NR)*
+        - **4.1.3.6.1** startDate *(O, NR)*
+        - **4.1.3.6.2** endDate *(O, NR)*
+    - **4.1.4** licenseInformation *(O, NR)*
+      - **4.1.4.1** licenseDocumentationIdentifier *(O, R)*
+        - **4.1.4.1.1** licenseDocumentationIdentifierType *(M, NR)*
+        - **4.1.4.1.2** licenseDocumentationIdentifierValue *(M, NR)*
+        - **4.1.4.1.3** licenseDocumentationRole *(O, NR)*
+      - **4.1.4.2** licenseTerms *(O, NR)*
+      - **4.1.4.3** licenseNote *(O, R)*
+      - **4.1.4.4** licenseApplicableDates *(O, NR)*
+        - **4.1.4.4.1** startDate *(O, NR)*
+        - **4.1.4.4.2** endDate *(O, NR)*
+    - **4.1.5** statuteInformation *(O, R)*
+      - **4.1.5.1** statuteJurisdiction *(M, NR)*
+      - **4.1.5.2** statuteCitation *(M, NR)*
+      - **4.1.5.3** statuteInformationDeterminationDate *(O, NR)*
+      - **4.1.5.4** statuteNote *(O, R)*
+      - **4.1.5.5** statuteDocumentationIdentifier *(O, R)*
+        - **4.1.5.5.1** statuteDocumentationIdentifierType *(M, NR)*
+        - **4.1.5.5.2** statuteDocumentationIdentifierValue *(M, NR)*
+        - **4.1.5.5.3** statuteDocumentationRole *(O, NR)*
+      - **4.1.5.6** statuteApplicableDates *(O, NR)*
+        - **4.1.5.6.1** startDate *(O, NR)*
+        - **4.1.5.6.2** endDate *(O, NR)*
+    - **4.1.6** otherRightsInformation *(O, NR)*
+      - **4.1.6.1** otherRightsDocumentationIdentifier *(O, R)*
+        - **4.1.6.1.1** otherRightsDocumentationIdentifierType *(M, NR)*
+        - **4.1.6.1.2** otherRightsDocumentationIdentifierValue *(M, NR)*
+        - **4.1.6.1.3** otherRightsDocumentationRole *(O, NR)*
+      - **4.1.6.2** otherRightsBasis *(M, NR)*
+      - **4.1.6.3** otherRightsApplicableDates *(O, NR)*
+        - **4.1.6.3.1** startDate *(O, NR)*
+        - **4.1.6.3.2** endDate *(O, NR)*
+      - **4.1.6.4** otherRightsNote *(O, R)*
+    - **4.1.7** rightsGranted *(O, R)*
+      - **4.1.7.1** act *(M, NR)*
+      - **4.1.7.2** restriction *(O, R)*
+      - **4.1.7.3** termOfGrant *(O, NR)*
+        - **4.1.7.3.1** startDate *(M, NR)*
+        - **4.1.7.3.2** endDate *(O, NR)*
+      - **4.1.7.4** termOfRestriction *(O, NR)*
+        - **4.1.7.4.1** startDate *(M, NR)*
+        - **4.1.7.4.2** endDate *(O, NR)*
+      - **4.1.7.5** rightsGrantedNote *(O, R)*
+    - **4.1.8** linkingObjectIdentifier *(O, R)*
+      - **4.1.8.1** linkingObjectIdentifierType *(M, NR)*
+      - **4.1.8.2** linkingObjectIdentifierValue *(M, NR)*
+      - **4.1.8.3** linkingObjectRole *(O, R)*
+    - **4.1.9** linkingAgentIdentifier *(O, R)*
+      - **4.1.9.1** linkingAgentIdentifierType *(M, NR)*
+      - **4.1.9.2** linkingAgentIdentifierValue *(M, NR)*
+      - **4.1.9.3** linkingAgentRole *(O, R)*
+  - **4.2** rightsExtension *(O, R)*
+

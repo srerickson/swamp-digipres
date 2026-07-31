@@ -1,3 +1,14 @@
+# Digital Preservation Workflows
+
+Using swamp to manage digital preservation in an OCFL-based
+repository. Modeled on the PREMIS controlled vocabulary.
+
+
+## Tools
+
+- OCFL CLI (`go install github.com/srerickson/ocfl-tools/cmd/ocfl@latest`): `ocfl --help` 
+
+
 <!-- BEGIN swamp managed section - DO NOT EDIT -->
 # Project
 
