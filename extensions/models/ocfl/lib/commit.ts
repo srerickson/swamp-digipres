@@ -1,10 +1,19 @@
 /**
  * Atomic version writing: unified ingest (new object) and update (new version).
  *
- * Everything is staged outside the storage root and moved in with `rename(2)`,
- * so a crash leaves either the previous consistent state or the new one — with
- * one documented exception, the two-write window when replacing the root
- * inventory and its sidecar (see {@link FinalizeStep}).
+ * Two finalize strategies, chosen by the storage backend:
+ *
+ * - **Local:** everything is staged outside the storage root and moved in
+ *   with `rename(2)`, so a crash leaves either the previous consistent state
+ *   or the new one — with one documented exception, the two-write window when
+ *   replacing the root inventory and its sidecar (see {@link FinalizeStep}).
+ * - **Object store (S3/memory):** there is no rename, so content is written
+ *   directly to its final keys — nothing is live until the root inventory and
+ *   sidecar are replaced. Ingest claims the object root with a conditional
+ *   first write; update finalizes the root inventory with a conditional
+ *   (if-match) write against the entity tag captured at re-verify. A crash
+ *   mid-sequence leaves either a claimed-but-partial object (rolled back
+ *   best-effort) or a stray version prefix the validator reports as E046.
  *
  * OCFL has no locking. This library assumes a sole-writer contract per storage
  * root and re-verifies the object's head immediately before finalizing, which
@@ -12,17 +21,22 @@
  *
  * @module
  */
+import type { StorageBackend } from "./backend/backend.ts";
+import { joinKey, PreconditionFailedError } from "./backend/backend.ts";
+import { LocalBackend } from "./backend/local.ts";
 import { HeadConflictError, OcflError } from "./errors.ts";
 import {
   bytesEqual,
+  INVENTORY_FILENAME,
   readInventoryVerified,
   serializeInventory,
   writeInventoryPair,
+  writeSidecar,
 } from "./inventory.ts";
-import { writeNamaste } from "./namaste.ts";
+import { namasteContent, namasteFilename, writeNamaste } from "./namaste.ts";
 import type { OcflObject, StorageRoot } from "./object.ts";
 import { locateObject } from "./object.ts";
-import { joinOcflPath, validateContentDirectory } from "./paths.ts";
+import { validateContentDirectory } from "./paths.ts";
 import { digestFile, isDigestAlgorithmSupported } from "./digest.ts";
 import type { NewContent } from "./state.ts";
 import { buildNextState, walkSource } from "./state.ts";
@@ -122,15 +136,20 @@ export function nowRfc3339(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
 }
 
-/** Whether a path exists. */
-async function exists(path: string): Promise<boolean> {
-  try {
-    await Deno.lstat(path);
-    return true;
-  } catch (cause) {
-    if (cause instanceof Deno.errors.NotFound) return false;
-    throw cause;
+/**
+ * Absolute directory of a local storage root.
+ *
+ * The staging-and-rename finalize strategy is inherently local; other backends
+ * get their own finalize sequence.
+ */
+function localRootDir(root: StorageRoot): string {
+  if (!(root.backend instanceof LocalBackend)) {
+    throw new OcflError(
+      `the local finalize strategy was invoked for a ${root.backend.kind} storage root`,
+      { path: root.path },
+    );
   }
+  return root.backend.rootDir;
 }
 
 /** Device id of the filesystem holding a path. */
@@ -147,8 +166,9 @@ async function createStagingDir(
   root: StorageRoot,
   requested: string | undefined,
 ): Promise<string> {
+  const rootDir = localRootDir(root);
   const base = requested ??
-    `${dirname(root.path)}/.${basename(root.path)}-staging`;
+    `${dirname(rootDir)}/.${basename(rootDir)}-staging`;
 
   try {
     await Deno.mkdir(base, { recursive: true });
@@ -161,11 +181,11 @@ async function createStagingDir(
     );
   }
 
-  const rootDevice = await deviceOf(root.path);
+  const rootDevice = await deviceOf(rootDir);
   const stagingDevice = await deviceOf(base);
   if (rootDevice !== stagingDevice) {
     throw new OcflError(
-      `staging directory ${base} is on a different filesystem than the storage root ${root.path}; ` +
+      `staging directory ${base} is on a different filesystem than the storage root ${rootDir}; ` +
         "the commit could not be finalized atomically. Set stagingDir to a directory on the same filesystem.",
       { path: base },
     );
@@ -178,17 +198,18 @@ async function createStagingDir(
  * Verify that the directories leading to an object root hold no files (E084)
  * and create them.
  */
-async function prepareIntermediateDirectories(
+async function checkIntermediateDirectories(
   root: StorageRoot,
   relativePath: string,
 ): Promise<void> {
   const segments = relativePath.split("/");
-  let current = root.path;
+  let current = "";
   for (const segment of segments.slice(0, -1)) {
-    current = `${current}/${segment}`;
-    if (!(await exists(current))) break;
-    for await (const entry of Deno.readDir(current)) {
-      if (!entry.isDirectory) {
+    current = joinKey(current, segment);
+    const entries = await root.backend.list(current);
+    if (entries === null) break;
+    for (const entry of entries) {
+      if (entry.kind !== "dir") {
         throw new OcflError(
           `storage hierarchy directory ${current} contains a file (${entry.name}); ` +
             "intermediate directories must contain only directories",
@@ -197,9 +218,6 @@ async function prepareIntermediateDirectories(
       }
     }
   }
-  await Deno.mkdir(dirname(`${root.path}/${relativePath}`), {
-    recursive: true,
-  });
 }
 
 /** Copy a file, creating its parent directories. */
@@ -223,6 +241,14 @@ export async function commit(
   root: StorageRoot,
   options: CommitOptions,
 ): Promise<CommitResult> {
+  if (
+    options.stagingDir !== undefined && !(root.backend instanceof LocalBackend)
+  ) {
+    throw new OcflError(
+      `stagingDir applies only to local storage roots; ${root.path} stages nothing locally`,
+      { path: root.path },
+    );
+  }
   const sourceInfo = await Deno.stat(options.sourcePath).catch(() => null);
   if (sourceInfo === null || !sourceInfo.isDirectory) {
     throw new OcflError(
@@ -345,13 +371,12 @@ async function ingest(
   }
 
   const relativePath = root.layout.resolve(options.id);
-  const objectPath = `${root.path}/${relativePath}`;
-  if (await exists(objectPath)) {
+  if (await root.backend.prefixExists(relativePath)) {
     throw new OcflError(
       `object root ${relativePath} already exists but holds no object with id ${
         JSON.stringify(options.id)
       }`,
-      { path: objectPath },
+      { path: relativePath },
     );
   }
 
@@ -394,31 +419,26 @@ async function ingest(
   );
   const inventoryBytes = serializeInventory(inventory);
 
-  const staging = await createStagingDir(root, options.stagingDir);
-  try {
-    // Stage the entire object root, so it lands complete in one rename.
-    const staged = `${staging}/object`;
-    await Deno.mkdir(`${staged}/${versionName}`, { recursive: true });
-    await writeNamaste(staged, "object", "1.1");
-    for (const content of next.newContent) {
-      await copyInto(content.sourcePath, `${staged}/${content.contentPath}`);
-    }
-    await writeInventoryPair(
-      `${staged}/${versionName}`,
+  if (root.backend instanceof LocalBackend) {
+    await finalizeIngestLocal(
+      root,
+      options,
+      relativePath,
+      versionName,
+      next.newContent,
       inventoryBytes,
       digestAlgorithm,
     );
-    await writeInventoryPair(staged, inventoryBytes, digestAlgorithm);
-
-    await prepareIntermediateDirectories(root, relativePath);
-    await options.onFinalizeStep?.("before-finalize");
-    if (await exists(objectPath)) {
-      throw new HeadConflictError(relativePath, "<absent>", "<created>");
-    }
-    await Deno.rename(staged, objectPath);
-    await options.onFinalizeStep?.("after-root-sidecar");
-  } finally {
-    await Deno.remove(staging, { recursive: true }).catch(() => {});
+  } else {
+    await finalizeIngestObjectStore(
+      root,
+      options,
+      relativePath,
+      versionName,
+      next.newContent,
+      inventoryBytes,
+      digestAlgorithm,
+    );
   }
 
   return {
@@ -432,6 +452,119 @@ async function ingest(
     deletedPaths: next.deletedPaths,
     newContentCount: next.newContent.length,
   };
+}
+
+/**
+ * Land a new object on a local filesystem: stage the complete object root
+ * outside the storage root, then move it in with one atomic rename.
+ */
+async function finalizeIngestLocal(
+  root: StorageRoot,
+  options: CommitOptions,
+  relativePath: string,
+  versionName: string,
+  newContent: readonly NewContent[],
+  inventoryBytes: Uint8Array,
+  digestAlgorithm: DigestAlgorithm,
+): Promise<void> {
+  const objectPath = `${localRootDir(root)}/${relativePath}`;
+  const staging = await createStagingDir(root, options.stagingDir);
+  try {
+    // Stage the entire object root, so it lands complete in one rename.
+    const staged = `${staging}/object`;
+    const stagedBackend = new LocalBackend(staged);
+    await Deno.mkdir(`${staged}/${versionName}`, { recursive: true });
+    await writeNamaste(stagedBackend, "", "object", "1.1");
+    for (const content of newContent) {
+      await copyInto(content.sourcePath, `${staged}/${content.contentPath}`);
+    }
+    await writeInventoryPair(
+      stagedBackend,
+      versionName,
+      inventoryBytes,
+      digestAlgorithm,
+    );
+    await writeInventoryPair(stagedBackend, "", inventoryBytes, digestAlgorithm);
+
+    await checkIntermediateDirectories(root, relativePath);
+    await Deno.mkdir(dirname(objectPath), { recursive: true });
+    await options.onFinalizeStep?.("before-finalize");
+    if (await root.backend.exists(relativePath)) {
+      throw new HeadConflictError(relativePath, "<absent>", "<created>");
+    }
+    await Deno.rename(staged, objectPath);
+    await options.onFinalizeStep?.("after-root-sidecar");
+  } finally {
+    await Deno.remove(staging, { recursive: true }).catch(() => {});
+  }
+}
+
+/**
+ * Land a new object on an object store: claim the object root with a
+ * conditional first write, then write content and inventories directly to
+ * their final keys, root sidecar last.
+ *
+ * Nothing under the claimed prefix is treated as live by readers until the
+ * root inventory and sidecar exist, so direct writes are safe. On failure
+ * after the claim the partial object is removed best-effort; a crash instead
+ * leaves a partial object the validator reports (and that blocks re-ingest
+ * until removed — the claim is first-writer-wins).
+ */
+async function finalizeIngestObjectStore(
+  root: StorageRoot,
+  options: CommitOptions,
+  relativePath: string,
+  versionName: string,
+  newContent: readonly NewContent[],
+  inventoryBytes: Uint8Array,
+  digestAlgorithm: DigestAlgorithm,
+): Promise<void> {
+  const backend = root.backend;
+  await checkIntermediateDirectories(root, relativePath);
+  await options.onFinalizeStep?.("before-finalize");
+
+  // The conditional namaste write is the object-store analog of the local
+  // exists-check-plus-rename: exactly one writer can create it.
+  try {
+    await backend.write(
+      joinKey(relativePath, namasteFilename("object", "1.1")),
+      new TextEncoder().encode(namasteContent("object", "1.1")),
+      { ifNoneMatch: true },
+    );
+  } catch (cause) {
+    if (cause instanceof PreconditionFailedError) {
+      throw new HeadConflictError(relativePath, "<absent>", "<created>");
+    }
+    throw cause;
+  }
+
+  try {
+    for (const content of newContent) {
+      await backend.writeFromFile(
+        joinKey(relativePath, content.contentPath),
+        content.sourcePath,
+      );
+    }
+    await writeInventoryPair(
+      backend,
+      joinKey(relativePath, versionName),
+      inventoryBytes,
+      digestAlgorithm,
+    );
+    await options.onFinalizeStep?.("after-version-move");
+    await backend.write(
+      joinKey(relativePath, INVENTORY_FILENAME),
+      inventoryBytes,
+    );
+    await options.onFinalizeStep?.("after-root-inventory");
+    // Sidecar last — it is the commit marker (E062).
+    await writeSidecar(backend, relativePath, inventoryBytes, digestAlgorithm);
+    await options.onFinalizeStep?.("after-root-sidecar");
+  } catch (cause) {
+    // We hold the claim, so the prefix is ours to clean up.
+    await backend.deletePrefix(relativePath).catch(() => {});
+    throw cause;
+  }
 }
 
 /** Add a new version to an existing object. */
@@ -491,20 +624,73 @@ async function update(
   );
   const inventoryBytes = serializeInventory(inventory);
 
+  if (root.backend instanceof LocalBackend) {
+    await finalizeUpdateLocal(
+      root,
+      object,
+      options,
+      versionName,
+      next.newContent,
+      inventoryBytes,
+      previous.digestAlgorithm,
+      previousHead,
+    );
+  } else {
+    await finalizeUpdateObjectStore(
+      root,
+      object,
+      options,
+      versionName,
+      next.newContent,
+      inventoryBytes,
+      previous.digestAlgorithm,
+      previousHead,
+    );
+  }
+
+  return {
+    id: previous.id,
+    objectPath: object.relativePath,
+    created: false,
+    previousHead,
+    head: versionName,
+    addedPaths: next.addedPaths,
+    modifiedPaths: next.modifiedPaths,
+    deletedPaths: next.deletedPaths,
+    newContentCount: next.newContent.length,
+  };
+}
+
+/**
+ * Land a new version on a local filesystem: stage the version directory
+ * outside the storage root, re-verify the head, move it in with one rename,
+ * then replace the root inventory pair, sidecar last.
+ */
+async function finalizeUpdateLocal(
+  root: StorageRoot,
+  object: OcflObject,
+  options: CommitOptions,
+  versionName: string,
+  newContent: readonly NewContent[],
+  inventoryBytes: Uint8Array,
+  digestAlgorithm: DigestAlgorithm,
+  previousHead: string,
+): Promise<void> {
   const staging = await createStagingDir(root, options.stagingDir);
   try {
     const stagedVersion = `${staging}/${versionName}`;
     await Deno.mkdir(stagedVersion, { recursive: true });
-    for (const content of next.newContent) {
+    for (const content of newContent) {
       // Content paths are prefixed with the version name; strip it, since the
       // staged directory *is* that version directory.
       const withinVersion = content.contentPath.slice(versionName.length + 1);
       await copyInto(content.sourcePath, `${stagedVersion}/${withinVersion}`);
     }
     await writeInventoryPair(
-      stagedVersion,
+      new LocalBackend(stagedVersion),
+      "",
       inventoryBytes,
-      previous.digestAlgorithm,
+      digestAlgorithm,
     );
 
     await options.onFinalizeStep?.("before-finalize");
@@ -512,7 +698,10 @@ async function update(
     // Re-verify the head immediately before finalizing, after all staging is
     // done: OCFL has no locking, and another writer may have advanced the
     // object while we were staging.
-    const current = await readInventoryVerified(object.absolutePath);
+    const current = await readInventoryVerified(
+      root.backend,
+      object.relativePath,
+    );
     if (
       current.inventory.head !== previousHead ||
       !bytesEqual(current.bytes, object.inventoryBytes)
@@ -523,8 +712,9 @@ async function update(
         current.inventory.head,
       );
     }
-    const targetVersionPath = `${object.absolutePath}/${versionName}`;
-    if (await exists(targetVersionPath)) {
+    const versionKey = joinKey(object.relativePath, versionName);
+    const targetVersionPath = `${localRootDir(root)}/${versionKey}`;
+    if (await root.backend.exists(versionKey)) {
       throw new HeadConflictError(
         object.relativePath,
         previousHead,
@@ -549,34 +739,136 @@ async function update(
     await options.onFinalizeStep?.("after-version-move");
 
     // The root inventory is a byte copy of the one just written (E064).
-    await Deno.writeFile(
-      `${object.absolutePath}/inventory.json`,
+    await root.backend.write(
+      joinKey(object.relativePath, INVENTORY_FILENAME),
       inventoryBytes,
     );
     await options.onFinalizeStep?.("after-root-inventory");
 
     // Sidecar last — it is the commit marker (E062).
-    await writeInventoryPair(
-      object.absolutePath,
+    await writeSidecar(
+      root.backend,
+      object.relativePath,
       inventoryBytes,
-      previous.digestAlgorithm,
+      digestAlgorithm,
     );
     await options.onFinalizeStep?.("after-root-sidecar");
   } finally {
     await Deno.remove(staging, { recursive: true }).catch(() => {});
   }
+}
 
-  return {
-    id: previous.id,
-    objectPath: object.relativePath,
-    created: false,
-    previousHead,
-    head: versionName,
-    addedPaths: next.addedPaths,
-    modifiedPaths: next.modifiedPaths,
-    deletedPaths: next.deletedPaths,
-    newContentCount: next.newContent.length,
-  };
+/** Head recorded in serialized inventory bytes, for conflict reporting. */
+function headOfBytes(bytes: Uint8Array | undefined): string {
+  if (bytes === undefined) return "<unknown>";
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
+      head?: string;
+    };
+    return typeof parsed.head === "string" ? parsed.head : "<unknown>";
+  } catch {
+    return "<unknown>";
+  }
+}
+
+/**
+ * Land a new version on an object store: write the version's content and
+ * inventory directly to their final keys (not live until the root inventory
+ * moves), re-verify the head capturing its entity tag, then replace the root
+ * inventory with a conditional write and the sidecar last.
+ *
+ * On a head conflict nothing is rolled back — a competing writer may own the
+ * same version prefix, and deleting it would destroy their commit. Other
+ * failures remove the partial version prefix best-effort.
+ */
+async function finalizeUpdateObjectStore(
+  root: StorageRoot,
+  object: OcflObject,
+  options: CommitOptions,
+  versionName: string,
+  newContent: readonly NewContent[],
+  inventoryBytes: Uint8Array,
+  digestAlgorithm: DigestAlgorithm,
+  previousHead: string,
+): Promise<void> {
+  const backend = root.backend;
+  const versionKey = joinKey(object.relativePath, versionName);
+
+  await options.onFinalizeStep?.("before-finalize");
+  if (await backend.prefixExists(versionKey)) {
+    throw new HeadConflictError(object.relativePath, previousHead, versionName);
+  }
+
+  // Once the root-inventory replace is attempted the version prefix may be
+  // referenced by the live inventory, so rollback is only safe before it.
+  let rootInventoryAttempted = false;
+  try {
+    for (const content of newContent) {
+      await backend.writeFromFile(
+        joinKey(object.relativePath, content.contentPath),
+        content.sourcePath,
+      );
+    }
+    await writeInventoryPair(
+      backend,
+      versionKey,
+      inventoryBytes,
+      digestAlgorithm,
+    );
+    await options.onFinalizeStep?.("after-version-move");
+
+    // Re-verify the head immediately before the final write, capturing the
+    // root inventory's entity tag so the replacement can be conditional.
+    const current = await backend.readWithMeta(
+      joinKey(object.relativePath, INVENTORY_FILENAME),
+    );
+    if (current === null || !bytesEqual(current.data, object.inventoryBytes)) {
+      throw new HeadConflictError(
+        object.relativePath,
+        previousHead,
+        headOfBytes(current?.data),
+      );
+    }
+
+    // The root inventory is a byte copy of the one just written (E064). The
+    // if-match condition closes the re-verify -> replace race on stores that
+    // enforce it.
+    rootInventoryAttempted = true;
+    try {
+      await backend.write(
+        joinKey(object.relativePath, INVENTORY_FILENAME),
+        inventoryBytes,
+        current.etag === undefined ? undefined : { ifMatch: current.etag },
+      );
+    } catch (cause) {
+      if (cause instanceof PreconditionFailedError) {
+        throw new HeadConflictError(
+          object.relativePath,
+          previousHead,
+          "<unknown>",
+        );
+      }
+      throw cause;
+    }
+    await options.onFinalizeStep?.("after-root-inventory");
+
+    // Sidecar last — it is the commit marker (E062).
+    await writeSidecar(
+      backend,
+      object.relativePath,
+      inventoryBytes,
+      digestAlgorithm,
+    );
+    await options.onFinalizeStep?.("after-root-sidecar");
+  } catch (cause) {
+    // A head conflict means a competitor may own the same version prefix —
+    // deleting it would destroy their commit — and a failed conditional
+    // replace may still have landed; roll back only unambiguous failures.
+    if (!(cause instanceof HeadConflictError) && !rootInventoryAttempted) {
+      await backend.deletePrefix(versionKey).catch(() => {});
+    }
+    throw cause;
+  }
 }
 
 /**
@@ -586,7 +878,7 @@ async function update(
  * declaration or is not empty.
  */
 export async function initStorageRoot(
-  path: string,
+  backend: StorageBackend,
   options: {
     layoutDigestAlgorithm?: string;
     tupleSize?: number;
@@ -594,11 +886,13 @@ export async function initStorageRoot(
     description?: string;
   } = {},
 ): Promise<void> {
-  await Deno.mkdir(path, { recursive: true });
-  for await (const entry of Deno.readDir(path)) {
+  const existing = await backend.list("");
+  if (existing !== null && existing.length > 0) {
     throw new OcflError(
-      `refusing to initialize a storage root in a non-empty directory (found ${entry.name})`,
-      { path },
+      `refusing to initialize a storage root in a non-empty directory (found ${
+        existing[0].name
+      })`,
+      { path: backend.url },
     );
   }
 
@@ -611,10 +905,11 @@ export async function initStorageRoot(
     shortObjectRoot: false,
   };
 
-  await writeNamaste(path, "root", "1.1");
-  await Deno.writeTextFile(
-    `${path}/ocfl_layout.json`,
-    `${
+  const encoder = new TextEncoder();
+  await writeNamaste(backend, "", "root", "1.1");
+  await backend.write(
+    "ocfl_layout.json",
+    encoder.encode(`${
       JSON.stringify(
         {
           extension: extensionName,
@@ -624,12 +919,10 @@ export async function initStorageRoot(
         null,
         2,
       )
-    }\n`,
+    }\n`),
   );
-  const extensionDir = joinOcflPath(path, "extensions", extensionName);
-  await Deno.mkdir(extensionDir, { recursive: true });
-  await Deno.writeTextFile(
-    `${extensionDir}/config.json`,
-    `${JSON.stringify(config, null, 2)}\n`,
+  await backend.write(
+    `extensions/${extensionName}/config.json`,
+    encoder.encode(`${JSON.stringify(config, null, 2)}\n`),
   );
 }

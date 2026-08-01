@@ -21,9 +21,6 @@ const NODE_HASH_NAMES: Record<string, string> = {
   "blake2b-512": "blake2b512",
 };
 
-/** Chunk size for streaming file reads. */
-const CHUNK_SIZE = 64 * 1024;
-
 /**
  * Whether the runtime can compute the named OCFL algorithm.
  *
@@ -48,7 +45,29 @@ function nodeHashName(algorithm: string): string {
 }
 
 /**
- * Digest a file by streaming it through the named algorithm.
+ * Digest a byte stream through the named algorithm.
+ *
+ * Used for backend content (an S3 GET body is a stream) and, via
+ * {@link digestFile}, for local files.
+ *
+ * @returns Lowercase hex digest (E029–E031 require hex encoding).
+ */
+export async function digestStream(
+  stream: ReadableStream<Uint8Array>,
+  algorithm: string,
+): Promise<string> {
+  const hash = createHash(nodeHashName(algorithm));
+  for await (const chunk of stream) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex").toLowerCase();
+}
+
+/**
+ * Digest a local file by streaming it through the named algorithm.
+ *
+ * Source trees for commits are always local directories, so this stays a
+ * plain-path API alongside the backend-based {@link digestStream}.
  *
  * @returns Lowercase hex digest (E029–E031 require hex encoding).
  */
@@ -56,19 +75,8 @@ export async function digestFile(
   path: string,
   algorithm: string,
 ): Promise<string> {
-  const hash = createHash(nodeHashName(algorithm));
   const file = await Deno.open(path, { read: true });
-  try {
-    const buffer = new Uint8Array(CHUNK_SIZE);
-    while (true) {
-      const bytesRead = await file.read(buffer);
-      if (bytesRead === null) break;
-      hash.update(buffer.subarray(0, bytesRead));
-    }
-  } finally {
-    file.close();
-  }
-  return hash.digest("hex").toLowerCase();
+  return await digestStream(file.readable, algorithm);
 }
 
 /**

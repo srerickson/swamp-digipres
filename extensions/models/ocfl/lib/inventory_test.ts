@@ -11,14 +11,19 @@ import {
 } from "./inventory.ts";
 import { digestBytes } from "./digest.ts";
 import { INVENTORY_TYPE_1_1 } from "./types.ts";
+import type { StorageBackend } from "./backend/backend.ts";
+import { readText } from "./backend/backend.ts";
 import {
+  BACKEND_KINDS,
   FIXTURE_IDS,
   FIXTURE_PATHS,
-  FIXTURE_ROOT,
-  withTempDir,
+  fixtureBackend,
+  withEmptyBackend,
 } from "./test_util.ts";
 
-const SPEC_OBJECT = `${FIXTURE_ROOT}/${FIXTURE_PATHS[FIXTURE_IDS.spec]}`;
+const encoder = new TextEncoder();
+
+const SPEC_KEY = FIXTURE_PATHS[FIXTURE_IDS.spec];
 
 function codes(issues: { code: string }[]): string[] {
   return issues.map((issue) => issue.code);
@@ -41,7 +46,7 @@ function minimalInventory() {
 }
 
 Deno.test("fixture inventories parse and verify against their sidecars", async () => {
-  const result = await checkInventory(SPEC_OBJECT, "object");
+  const result = await checkInventory(fixtureBackend(), SPEC_KEY, "object");
   assertEquals(result.issues, []);
   assertEquals(result.sidecarVerified, true);
   assertEquals(result.loaded?.inventory.id, FIXTURE_IDS.spec);
@@ -49,8 +54,8 @@ Deno.test("fixture inventories parse and verify against their sidecars", async (
 });
 
 Deno.test("root inventory is byte-identical to the head version's (E064)", async () => {
-  const root = await readInventoryVerified(SPEC_OBJECT);
-  const head = await readInventoryVerified(`${SPEC_OBJECT}/v2`);
+  const root = await readInventoryVerified(fixtureBackend(), SPEC_KEY);
+  const head = await readInventoryVerified(fixtureBackend(), `${SPEC_KEY}/v2`);
   assertEquals(bytesEqual(root.bytes, head.bytes), true);
 });
 
@@ -111,68 +116,94 @@ Deno.test("parseSidecar accepts spaces and tabs, rejects other shapes (E061)", (
   assertEquals(codes(parseSidecar("abc123 other.json", "s").issues), ["E061"]);
 });
 
-Deno.test("writeInventoryPair writes a sidecar matching the exact bytes", async () => {
-  await withTempDir(async (dir) => {
-    const bytes = serializeInventory(minimalInventory());
-    await writeInventoryPair(dir, bytes, "sha512");
+for (const kind of BACKEND_KINDS) {
+  Deno.test(`[${kind}] writeInventoryPair writes a sidecar matching the exact bytes`, async () => {
+    await withEmptyBackend(kind, async (backend) => {
+      const bytes = serializeInventory(minimalInventory());
+      await writeInventoryPair(backend, "", bytes, "sha512");
 
-    const written = await Deno.readFile(`${dir}/inventory.json`);
-    assertEquals(bytesEqual(written, bytes), true);
+      const written = await backend.read("inventory.json");
+      assertEquals(written !== null && bytesEqual(written, bytes), true);
 
-    const sidecar = await Deno.readTextFile(
-      `${dir}/${sidecarFilename("sha512")}`,
-    );
-    assertEquals(sidecar, `${digestBytes(bytes, "sha512")} inventory.json\n`);
+      const sidecar = await readText(backend, sidecarFilename("sha512"));
+      assertEquals(sidecar, `${digestBytes(bytes, "sha512")} inventory.json\n`);
+    });
   });
-});
+}
 
-Deno.test("a corrupted sidecar digest is reported (E060)", async () => {
-  await withTempDir(async (dir) => {
-    await writeInventoryPair(
-      dir,
-      serializeInventory(minimalInventory()),
-      "sha512",
-    );
-    await Deno.writeTextFile(
-      `${dir}/${sidecarFilename("sha512")}`,
-      `${"0".repeat(128)} inventory.json\n`,
-    );
-    const result = await checkInventory(dir, "object");
-    assertEquals(codes(result.issues), ["E060"]);
-    assertEquals(result.sidecarVerified, false);
-    // Still loadable — this is the recoverable crash-window condition.
-    assertEquals(result.loaded?.inventory.id, "urn:test:object");
-    await assertRejects(() => readInventoryVerified(dir));
+for (const kind of BACKEND_KINDS) {
+  Deno.test(`[${kind}] a corrupted sidecar digest is reported (E060)`, async () => {
+    await withEmptyBackend(kind, async (backend) => {
+      await writeInventoryPair(
+        backend,
+        "",
+        serializeInventory(minimalInventory()),
+        "sha512",
+      );
+      await backend.write(
+        sidecarFilename("sha512"),
+        encoder.encode(`${"0".repeat(128)} inventory.json\n`),
+      );
+      const result = await checkInventory(backend, "", "object");
+      assertEquals(codes(result.issues), ["E060"]);
+      assertEquals(result.sidecarVerified, false);
+      // Still loadable — this is the recoverable crash-window condition.
+      assertEquals(result.loaded?.inventory.id, "urn:test:object");
+      await assertRejects(() => readInventoryVerified(backend, ""));
+    });
   });
-});
+}
 
-Deno.test("a sidecar whose algorithm disagrees is reported (E059)", async () => {
-  await withTempDir(async (dir) => {
-    const bytes = serializeInventory(minimalInventory());
-    await writeInventoryPair(dir, bytes, "sha512");
-    await Deno.rename(
-      `${dir}/${sidecarFilename("sha512")}`,
-      `${dir}/${sidecarFilename("sha256")}`,
-    );
-    assertEquals(codes((await checkInventory(dir, "object")).issues), ["E059"]);
-  });
-});
+async function renameKey(
+  backend: StorageBackend,
+  from: string,
+  to: string,
+): Promise<void> {
+  const data = await backend.read(from);
+  if (data === null) throw new Error(`no such key: ${from}`);
+  await backend.write(to, data);
+  await backend.delete(from);
+}
 
-Deno.test("a missing sidecar is reported (E058)", async () => {
-  await withTempDir(async (dir) => {
-    await Deno.writeFile(
-      `${dir}/inventory.json`,
-      serializeInventory(minimalInventory()),
-    );
-    assertEquals(codes((await checkInventory(dir, "object")).issues), ["E058"]);
+for (const kind of BACKEND_KINDS) {
+  Deno.test(`[${kind}] a sidecar whose algorithm disagrees is reported (E059)`, async () => {
+    await withEmptyBackend(kind, async (backend) => {
+      const bytes = serializeInventory(minimalInventory());
+      await writeInventoryPair(backend, "", bytes, "sha512");
+      await renameKey(
+        backend,
+        sidecarFilename("sha512"),
+        sidecarFilename("sha256"),
+      );
+      assertEquals(
+        codes((await checkInventory(backend, "", "object")).issues),
+        ["E059"],
+      );
+    });
   });
-});
 
-Deno.test("a missing inventory is reported (E063)", async () => {
-  await withTempDir(async (dir) => {
-    assertEquals(codes((await checkInventory(dir, "object")).issues), ["E063"]);
+  Deno.test(`[${kind}] a missing sidecar is reported (E058)`, async () => {
+    await withEmptyBackend(kind, async (backend) => {
+      await backend.write(
+        "inventory.json",
+        serializeInventory(minimalInventory()),
+      );
+      assertEquals(
+        codes((await checkInventory(backend, "", "object")).issues),
+        ["E058"],
+      );
+    });
   });
-});
+
+  Deno.test(`[${kind}] a missing inventory is reported (E063)`, async () => {
+    await withEmptyBackend(kind, async (backend) => {
+      assertEquals(
+        codes((await checkInventory(backend, "", "object")).issues),
+        ["E063"],
+      );
+    });
+  });
+}
 
 Deno.test("serializeInventory emits keys in specification order", () => {
   const text = new TextDecoder().decode(serializeInventory(minimalInventory()));

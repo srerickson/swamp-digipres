@@ -6,6 +6,8 @@
  *
  * @module
  */
+import type { StorageBackend } from "./backend/backend.ts";
+import { joinKey, readText } from "./backend/backend.ts";
 import type { ValidationIssue } from "./errors.ts";
 import { error, OcflError } from "./errors.ts";
 import { joinOcflPath } from "./paths.ts";
@@ -62,42 +64,39 @@ function matchDeclarations(entries: readonly string[], kind: NamasteKind) {
   });
 }
 
-/** List the immediate entry names of a directory, or `null` if absent. */
-async function listDir(dir: string): Promise<string[] | null> {
-  const entries: string[] = [];
-  try {
-    for await (const entry of Deno.readDir(dir)) {
-      entries.push(entry.name);
-    }
-  } catch (cause) {
-    if (cause instanceof Deno.errors.NotFound) return null;
-    throw cause;
-  }
-  return entries;
-}
-
 /**
  * Read and verify the NAMASTE declaration in a directory, collecting issues
  * rather than throwing.
  *
+ * @param key Storage-root-relative key of the directory; `""` for the root.
  * @returns The parsed declaration (`null` when missing or malformed) alongside
  * every issue found.
  */
 export async function checkNamaste(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
   kind: NamasteKind,
   location: string,
 ): Promise<{ namaste: Namaste | null; issues: ValidationIssue[] }> {
   const codes = CODES[kind];
-  const entries = await listDir(dir);
+  const entries = await backend.list(key);
   if (entries === null) {
     return {
       namaste: null,
-      issues: [error(codes.missing, location, `directory not found: ${dir}`)],
+      issues: [
+        error(
+          codes.missing,
+          location,
+          `directory not found: ${joinKey(backend.url, key)}`,
+        ),
+      ],
     };
   }
 
-  const matches = matchDeclarations(entries, kind);
+  const matches = matchDeclarations(
+    entries.filter((entry) => entry.kind === "file").map((entry) => entry.name),
+    kind,
+  );
   if (matches.length === 0) {
     return {
       namaste: null,
@@ -142,7 +141,7 @@ export async function checkNamaste(
   }
 
   const expected = namasteContent(kind, version);
-  const actual = await Deno.readTextFile(`${dir}/${filename}`);
+  const actual = await readText(backend, joinKey(key, filename));
   if (actual !== expected) {
     issues.push(
       error(
@@ -165,15 +164,17 @@ export async function checkNamaste(
  * proceed at all; the validator uses {@link checkNamaste} instead.
  */
 export async function readNamaste(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
   kind: NamasteKind,
 ): Promise<Namaste> {
-  const { namaste, issues } = await checkNamaste(dir, kind, dir);
+  const where = joinKey(backend.url, key);
+  const { namaste, issues } = await checkNamaste(backend, key, kind, where);
   if (namaste === null || issues.length > 0) {
     const issue = issues[0];
     throw new OcflError(
-      issue?.message ?? `invalid ${kind} conformance declaration in ${dir}`,
-      { code: issue?.code, path: dir },
+      issue?.message ?? `invalid ${kind} conformance declaration in ${where}`,
+      { code: issue?.code, path: where },
     );
   }
   return namaste;
@@ -181,12 +182,13 @@ export async function readNamaste(
 
 /** Write a conformance declaration into a directory. */
 export async function writeNamaste(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
   kind: NamasteKind,
   version: string,
 ): Promise<void> {
-  await Deno.writeTextFile(
-    `${dir}/${namasteFilename(kind, version)}`,
-    namasteContent(kind, version),
+  await backend.write(
+    joinKey(key, namasteFilename(kind, version)),
+    new TextEncoder().encode(namasteContent(kind, version)),
   );
 }

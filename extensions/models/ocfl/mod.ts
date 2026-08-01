@@ -3,7 +3,9 @@
  *
  * A native TypeScript OCFL client: reads objects, validates them against the
  * specification's E/W validation codes, and writes new versions atomically.
- * Methods are thin wrappers — all OCFL logic lives in `lib/`.
+ * Storage roots live on a local filesystem or an S3-compatible object store
+ * (`storageRoot: s3://bucket/prefix`). Methods are thin wrappers — all OCFL
+ * logic lives in `lib/`.
  *
  * Operational contract: one swamp model instance is the sole writer to a given
  * storage root. OCFL has no locking, so concurrent writers from other tools are
@@ -12,6 +14,9 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import { OcflError } from "./lib/errors.ts";
+import type { StorageBackend } from "./lib/backend/backend.ts";
+import { createBackend } from "./lib/backend/factory.ts";
 import { commit as commitObject, initStorageRoot } from "./lib/commit.ts";
 import { digestBytes } from "./lib/digest.ts";
 import type { OcflObject, StorageRoot } from "./lib/object.ts";
@@ -30,14 +35,36 @@ import { validateStorageRoot } from "./lib/validate.ts";
 /** Global arguments shared by every method on the model. */
 const GlobalArgsSchema = z.object({
   storageRoot: z.string().min(1).describe(
-    "Absolute path to the OCFL storage root",
+    "Absolute path to the OCFL storage root, or s3://bucket/prefix for an " +
+      "S3-compatible object store",
   ),
   digestAlgorithm: z.enum(["sha512", "sha256"]).default("sha512").describe(
     "Digest algorithm for newly created objects; existing objects keep their own",
   ),
   stagingDir: z.string().optional().describe(
-    "Directory to stage new versions in; must be on the same filesystem as the " +
-      "storage root. Defaults to a sibling of the storage root.",
+    "Local storage roots only: directory to stage new versions in; must be on " +
+      "the same filesystem as the storage root. Defaults to a sibling of the " +
+      "storage root. Rejected for s3:// roots, which stage nothing locally.",
+  ),
+  region: z.string().optional().describe(
+    "S3 region for s3:// storage roots; falls back to AWS_REGION",
+  ),
+  endpoint: z.string().optional().describe(
+    "Custom S3 endpoint origin for S3-compatible stores (MinIO, R2), " +
+      "e.g. https://minio.example.com:9000",
+  ),
+  forcePathStyle: z.boolean().default(false).describe(
+    "Use path-style S3 URLs (endpoint/bucket/key); implied when endpoint is set",
+  ),
+  accessKeyId: z.string().optional().describe(
+    "S3 access key id; falls back to AWS_ACCESS_KEY_ID",
+  ),
+  secretAccessKey: z.string().optional().meta({ sensitive: true }).describe(
+    'S3 secret access key; populate via ${{ vault.get(...) }}. Falls back to ' +
+      "AWS_SECRET_ACCESS_KEY",
+  ),
+  sessionToken: z.string().optional().meta({ sensitive: true }).describe(
+    "S3 session token for temporary credentials; falls back to AWS_SESSION_TOKEN",
   ),
 });
 
@@ -174,9 +201,24 @@ function buildSnapshot(
   };
 }
 
+/** A logger as swamp provides it to method and check executions. */
+interface Logger {
+  info: (message: string, properties?: unknown) => void;
+}
+
+/** Build the storage backend selected by the global arguments. */
+function backendFor(globalArgs: GlobalArgs, logger?: Logger): StorageBackend {
+  return createBackend(globalArgs, {
+    onWarning: (message) => logger?.info(message),
+  });
+}
+
 /** Open the configured storage root. */
-function openRoot(globalArgs: GlobalArgs): Promise<StorageRoot> {
-  return openStorageRoot(globalArgs.storageRoot);
+function openRoot(
+  globalArgs: GlobalArgs,
+  logger?: Logger,
+): Promise<StorageRoot> {
+  return openStorageRoot(backendFor(globalArgs, logger));
 }
 
 /** Arguments for the `get` method. */
@@ -233,9 +275,9 @@ const ValidateArgsSchema = z.object({
 /** Model definition for an OCFL storage root. */
 export const model = {
   type: "@crudec/ocfl-repository",
-  version: "2026.07.31.1",
+  version: "2026.08.01.1",
   description:
-    "Read, validate, and version objects in an OCFL 1.1 storage root",
+    "Read, validate, and version objects in an OCFL 1.1 storage root on a local filesystem or an S3-compatible object store",
   globalArguments: GlobalArgsSchema,
   resources: {
     "object": {
@@ -266,19 +308,27 @@ export const model = {
         globalArgs: GlobalArgs;
         logger: { info: (message: string, properties?: unknown) => void };
       }) => {
-        const path = context.globalArgs.storageRoot;
-        const info = await Deno.stat(path).catch(() => null);
-        if (info === null) {
+        const backend = backendFor(context.globalArgs, context.logger);
+        let entries;
+        try {
+          entries = await backend.list("");
+        } catch (cause) {
+          if (cause instanceof OcflError) {
+            // Local roots report "exists but is not a directory" this way.
+            return { pass: false, errors: [cause.message] };
+          }
+          throw cause;
+        }
+        if (entries === null) {
           // Nothing there yet — `init` is the method that creates it.
           return { pass: true };
         }
-        if (!info.isDirectory) {
-          return {
-            pass: false,
-            errors: [`storageRoot ${path} exists but is not a directory`],
-          };
-        }
-        const { namaste, issues } = await checkNamaste(path, "root", path);
+        const { namaste, issues } = await checkNamaste(
+          backend,
+          "",
+          "root",
+          backend.url,
+        );
         if (namaste === null) {
           return {
             pass: false,
@@ -306,10 +356,10 @@ export const model = {
           ) => Promise<{ name: string }>;
         },
       ) => {
-        await initStorageRoot(context.globalArgs.storageRoot, {
+        await initStorageRoot(backendFor(context.globalArgs, context.logger), {
           description: args.description,
         });
-        const root = await openRoot(context.globalArgs);
+        const root = await openRoot(context.globalArgs, context.logger);
 
         context.logger.info("Initialized OCFL storage root at {path}", {
           path: root.path,
@@ -350,7 +400,7 @@ export const model = {
           id: args.id,
           sourcePath: args.sourcePath,
         });
-        const root = await openRoot(context.globalArgs);
+        const root = await openRoot(context.globalArgs, context.logger);
 
         // W009 wants a URI; ocfl-tools writes a nonstandard `email:mailto:`
         // double scheme. Emit the standard form, accept anything on read.
@@ -388,7 +438,7 @@ export const model = {
 
         // Re-read what actually landed rather than reporting what we intended.
         const object = await requireObject(
-          await openRoot(context.globalArgs),
+          await openRoot(context.globalArgs, context.logger),
           args.id,
         );
         const handle = await context.writeResource(
@@ -415,7 +465,7 @@ export const model = {
           ) => Promise<{ name: string }>;
         },
       ) => {
-        const root = await openRoot(context.globalArgs);
+        const root = await openRoot(context.globalArgs, context.logger);
         const object = await requireObject(root, args.id);
         const version = args.version ?? object.inventory.head;
         const snapshot = buildSnapshot(object, version);
@@ -448,7 +498,7 @@ export const model = {
           ) => Promise<{ name: string }>;
         },
       ) => {
-        const root = await openRoot(context.globalArgs);
+        const root = await openRoot(context.globalArgs, context.logger);
         const objects = await listObjects(root);
 
         const index: z.infer<typeof IndexSchema> = {
@@ -505,7 +555,7 @@ export const model = {
         // One fan-out execution covering every requested object, rather than
         // one method run per object — the model lock is acquired once.
         const result = await validateStorageRoot(
-          context.globalArgs.storageRoot,
+          backendFor(context.globalArgs, context.logger),
           {
             ids: args.ids,
             fullFixity: args.fullFixity,

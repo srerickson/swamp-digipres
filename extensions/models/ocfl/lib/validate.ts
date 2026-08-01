@@ -13,10 +13,12 @@
  *
  * @module
  */
+import type { StorageBackend } from "./backend/backend.ts";
+import { joinKey } from "./backend/backend.ts";
 import type { ValidationIssue } from "./errors.ts";
 import { error, warning } from "./errors.ts";
 import {
-  digestFile,
+  digestStream,
   isDigestAlgorithmSupported,
   normalizeDigest,
 } from "./digest.ts";
@@ -87,12 +89,18 @@ interface DirEntries {
   directories: string[];
 }
 
-/** List a directory's immediate entries, split into files and directories. */
-async function listEntries(dir: string): Promise<DirEntries> {
+/**
+ * List a directory-like key's immediate entries, split into files and
+ * directories. A missing key lists as empty.
+ */
+async function listEntries(
+  backend: StorageBackend,
+  key: string,
+): Promise<DirEntries> {
   const files: string[] = [];
   const directories: string[] = [];
-  for await (const entry of Deno.readDir(dir)) {
-    if (entry.isDirectory) directories.push(entry.name);
+  for (const entry of await backend.list(key) ?? []) {
+    if (entry.kind === "dir") directories.push(entry.name);
     else files.push(entry.name);
   }
   files.sort();
@@ -100,32 +108,24 @@ async function listEntries(dir: string): Promise<DirEntries> {
   return { files, directories };
 }
 
-/** Whether a path exists. */
-async function exists(path: string): Promise<boolean> {
-  try {
-    await Deno.lstat(path);
-    return true;
-  } catch (cause) {
-    if (cause instanceof Deno.errors.NotFound) return false;
-    throw cause;
-  }
-}
-
 /**
- * Collect every file beneath a directory, as paths relative to `base`.
+ * Collect every file beneath a directory-like key, as paths relative to the
+ * object root.
  *
  * Also reports empty directories (E024), which have no representation in an
- * inventory and are therefore forbidden inside a content directory.
+ * inventory and are therefore forbidden inside a content directory. Backends
+ * without directories never produce an empty listing, which is correct —
+ * empty prefixes cannot exist there.
  */
 async function collectFiles(
-  dir: string,
-  base: string,
+  backend: StorageBackend,
+  key: string,
   prefix: string,
   issues: ValidationIssue[],
   emptyDirCode: string,
 ): Promise<string[]> {
   const collected: string[] = [];
-  const { files, directories } = await listEntries(dir);
+  const { files, directories } = await listEntries(backend, key);
   if (files.length === 0 && directories.length === 0) {
     issues.push(
       error(emptyDirCode, prefix, "directory is empty"),
@@ -138,8 +138,8 @@ async function collectFiles(
   for (const name of directories) {
     collected.push(
       ...await collectFiles(
-        `${dir}/${name}`,
-        base,
+        backend,
+        joinKey(key, name),
         joinOcflPath(prefix, name),
         issues,
         emptyDirCode,
@@ -491,8 +491,9 @@ function statesEqual(
  * repository that this client does not implement.
  */
 async function checkFixityBlock(
+  backend: StorageBackend,
   inventory: Inventory,
-  absolutePath: string,
+  objectKey: string,
   location: string,
 ): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
@@ -511,8 +512,8 @@ async function checkFixityBlock(
     }
     for (const [digest, contentPaths] of Object.entries(block)) {
       for (const contentPath of contentPaths) {
-        const filePath = `${absolutePath}/${contentPath}`;
-        if (!(await exists(filePath))) {
+        const fileKey = joinKey(objectKey, contentPath);
+        if (!(await backend.exists(fileKey))) {
           issues.push(
             error(
               "E093",
@@ -522,7 +523,10 @@ async function checkFixityBlock(
           );
           continue;
         }
-        const actual = await digestFile(filePath, algorithm);
+        const actual = await digestStream(
+          await backend.readStream(fileKey),
+          algorithm,
+        );
         if (actual !== normalizeDigest(digest)) {
           issues.push(
             error(
@@ -541,21 +545,22 @@ async function checkFixityBlock(
 /**
  * Validate a single OCFL object root.
  *
- * @param absolutePath Absolute path to the object root.
- * @param relativePath Path relative to the storage root, used in reporting.
+ * @param relativePath Object root key relative to the storage root, used both
+ * to address the object and in reporting.
  */
 export async function validateObject(
-  absolutePath: string,
+  backend: StorageBackend,
   relativePath: string,
   options: ValidateOptions = {},
 ): Promise<ObjectValidationResult> {
   const issues: ValidationIssue[] = [];
+  const objectKey = relativePath;
   const location = relativePath === "" ? "." : relativePath;
 
-  const namaste = await checkNamaste(absolutePath, "object", location);
+  const namaste = await checkNamaste(backend, objectKey, "object", location);
   issues.push(...namaste.issues);
 
-  const rootInventory = await checkInventory(absolutePath, location);
+  const rootInventory = await checkInventory(backend, objectKey, location);
   issues.push(...rootInventory.issues);
 
   const inventory = rootInventory.loaded?.inventory ?? null;
@@ -579,7 +584,7 @@ export async function validateObject(
 
   // Object root contents: only the declaration, inventory pair, version
   // directories, and the reserved `logs`/`extensions` directories (E001).
-  const rootEntries = await listEntries(absolutePath);
+  const rootEntries = await listEntries(backend, objectKey);
   for (const name of rootEntries.files) {
     const allowed = name === namaste.namaste?.filename ||
       name === INVENTORY_FILENAME ||
@@ -641,9 +646,9 @@ export async function validateObject(
   let headInventoryVerified = false;
 
   for (const versionName of sortVersionNames(versionDirsOnDisk)) {
-    const versionPath = `${absolutePath}/${versionName}`;
+    const versionKey = joinKey(objectKey, versionName);
     const versionLocation = joinOcflPath(location, versionName);
-    const entries = await listEntries(versionPath);
+    const entries = await listEntries(backend, versionKey);
 
     for (const name of entries.files) {
       if (
@@ -671,8 +676,8 @@ export async function validateObject(
     if (entries.directories.includes(contentDirectory)) {
       contentFilesOnDisk.push(
         ...await collectFiles(
-          `${versionPath}/${contentDirectory}`,
-          absolutePath,
+          backend,
+          joinKey(versionKey, contentDirectory),
           joinOcflPath(versionName, contentDirectory),
           issues,
           "E024",
@@ -691,7 +696,11 @@ export async function validateObject(
       continue;
     }
 
-    const versionInventory = await checkInventory(versionPath, versionLocation);
+    const versionInventory = await checkInventory(
+      backend,
+      versionKey,
+      versionLocation,
+    );
     issues.push(...versionInventory.issues);
     if (versionInventory.loaded === null) continue;
 
@@ -734,7 +743,7 @@ export async function validateObject(
   for (const [digest, contentPaths] of Object.entries(inventory.manifest)) {
     for (const contentPath of contentPaths) {
       manifestPaths.set(contentPath, digest);
-      if (!(await exists(`${absolutePath}/${contentPath}`))) {
+      if (!(await backend.exists(joinKey(objectKey, contentPath)))) {
         issues.push(
           error(
             "E092",
@@ -759,9 +768,12 @@ export async function validateObject(
 
   if (options.fullFixity === true) {
     for (const [contentPath, digest] of manifestPaths) {
-      const filePath = `${absolutePath}/${contentPath}`;
-      if (!(await exists(filePath))) continue;
-      const actual = await digestFile(filePath, inventory.digestAlgorithm);
+      const fileKey = joinKey(objectKey, contentPath);
+      if (!(await backend.exists(fileKey))) continue;
+      const actual = await digestStream(
+        await backend.readStream(fileKey),
+        inventory.digestAlgorithm,
+      );
       if (actual !== normalizeDigest(digest)) {
         issues.push(
           error(
@@ -773,7 +785,7 @@ export async function validateObject(
       }
     }
     issues.push(
-      ...await checkFixityBlock(inventory, absolutePath, location),
+      ...await checkFixityBlock(backend, inventory, objectKey, location),
     );
   }
 
@@ -814,12 +826,12 @@ function finish(
  * E084) and no directory is empty (E073).
  */
 async function checkStorageHierarchy(
-  root: string,
+  backend: StorageBackend,
 ): Promise<ValidationIssue[]> {
   const issues: ValidationIssue[] = [];
 
-  async function walk(absolute: string, relative: string): Promise<void> {
-    const { files, directories } = await listEntries(absolute);
+  async function walk(relative: string): Promise<void> {
+    const { files, directories } = await listEntries(backend, relative);
     const isObjectRoot = files.some((name) =>
       name.startsWith("0=ocfl_object_")
     );
@@ -845,14 +857,11 @@ async function checkStorageHierarchy(
 
     for (const name of directories) {
       if (relative === "" && name === "extensions") continue;
-      await walk(
-        `${absolute}/${name}`,
-        relative === "" ? name : `${relative}/${name}`,
-      );
+      await walk(joinKey(relative, name));
     }
   }
 
-  await walk(root, "");
+  await walk("");
   return issues;
 }
 
@@ -863,23 +872,23 @@ async function checkStorageHierarchy(
  * storage-root checks still run over the whole root.
  */
 export async function validateStorageRoot(
-  storageRoot: string,
+  backend: StorageBackend,
   options: ValidateOptions & { ids?: readonly string[] } = {},
 ): Promise<StorageRootValidationResult> {
   const rootIssues: ValidationIssue[] = [];
 
-  const namaste = await checkNamaste(storageRoot, "root", "");
+  const namaste = await checkNamaste(backend, "", "root", "");
   rootIssues.push(...namaste.issues);
-  rootIssues.push(...await checkStorageHierarchy(storageRoot));
+  rootIssues.push(...await checkStorageHierarchy(backend));
 
-  const discovered = await scanObjectRoots(storageRoot);
+  const discovered = await scanObjectRoots(backend);
   const wanted = options.ids === undefined ? null : new Set(options.ids);
   const objects: ObjectValidationResult[] = [];
   const seenIds = new Set<string>();
 
   for (const entry of discovered) {
     const result = await validateObject(
-      entry.absolutePath,
+      backend,
       entry.relativePath,
       options,
     );
@@ -922,7 +931,7 @@ export async function validateStorageRoot(
     issue.severity === "warning"
   );
   return {
-    storageRoot,
+    storageRoot: backend.url,
     checkedAt: new Date().toISOString(),
     fullFixity: options.fullFixity === true,
     valid: rootErrors.length === 0 &&

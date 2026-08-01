@@ -5,17 +5,23 @@ import {
   loadLayout,
   scanObjectRoots,
 } from "./layout.ts";
-import { FIXTURE_IDS, FIXTURE_PATHS, FIXTURE_ROOT } from "./test_util.ts";
+import {
+  BACKEND_KINDS,
+  FIXTURE_IDS,
+  FIXTURE_PATHS,
+  fixtureBackend,
+  withFixtureBackend,
+} from "./test_util.ts";
 
 Deno.test("loadLayout reads the fixture's declared 0004 layout", async () => {
-  const { layout, declaredExtension, reason } = await loadLayout(FIXTURE_ROOT);
+  const { layout, declaredExtension, reason } = await loadLayout(fixtureBackend());
   assertEquals(declaredExtension, HASHED_N_TUPLE_LAYOUT);
   assertEquals(reason, null);
   assertEquals(layout?.name, HASHED_N_TUPLE_LAYOUT);
 });
 
 Deno.test("0004 layout resolves every fixture id to its on-disk path", async () => {
-  const { layout } = await loadLayout(FIXTURE_ROOT);
+  const { layout } = await loadLayout(fixtureBackend());
   if (layout === null) throw new Error("expected a resolved layout");
   for (const [id, expected] of Object.entries(FIXTURE_PATHS)) {
     assertEquals(layout.resolve(id), expected, `layout path for ${id}`);
@@ -60,10 +66,23 @@ Deno.test("0004 layout rejects an unsupported digest algorithm", () => {
   );
 });
 
-Deno.test("scanObjectRoots finds every object and skips root extensions", async () => {
-  const found = await scanObjectRoots(FIXTURE_ROOT);
-  assertEquals(
-    found.map((entry) => entry.relativePath).sort(),
-    Object.values(FIXTURE_PATHS).sort(),
-  );
-});
+for (const kind of BACKEND_KINDS) {
+  Deno.test(`[${kind}] scanObjectRoots finds every object and skips root extensions`, async () => {
+    await withFixtureBackend(kind, async (backend) => {
+      const found = await scanObjectRoots(backend);
+      assertEquals(
+        found.map((entry) => entry.relativePath).sort(),
+        Object.values(FIXTURE_PATHS).sort(),
+      );
+    });
+  });
+
+  Deno.test(`[${kind}] loadLayout reads the declared 0004 layout`, async () => {
+    await withFixtureBackend(kind, async (backend) => {
+      const { layout, declaredExtension, reason } = await loadLayout(backend);
+      assertEquals(declaredExtension, HASHED_N_TUPLE_LAYOUT);
+      assertEquals(reason, null);
+      assertEquals(layout?.name, HASHED_N_TUPLE_LAYOUT);
+    });
+  });
+}

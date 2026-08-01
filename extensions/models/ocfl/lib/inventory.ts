@@ -9,6 +9,8 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import type { StorageBackend } from "./backend/backend.ts";
+import { joinKey, readText } from "./backend/backend.ts";
 import type { ValidationIssue } from "./errors.ts";
 import { error, OcflError } from "./errors.ts";
 import { digestBytes, digestsEqual } from "./digest.ts";
@@ -140,16 +142,6 @@ export function parseSidecar(
   return { digest: match[1], issues: [] };
 }
 
-/** Read a file, returning `null` when it does not exist. */
-async function readFileOrNull(path: string): Promise<Uint8Array | null> {
-  try {
-    return await Deno.readFile(path);
-  } catch (cause) {
-    if (cause instanceof Deno.errors.NotFound) return null;
-    throw cause;
-  }
-}
-
 /**
  * Find the sidecar file accompanying an inventory in a directory.
  *
@@ -158,19 +150,19 @@ async function readFileOrNull(path: string): Promise<Uint8Array | null> {
  * instead of appearing to be missing.
  */
 async function findSidecar(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
 ): Promise<{ filename: string; algorithm: string } | null> {
-  try {
-    for await (const entry of Deno.readDir(dir)) {
-      if (entry.isFile && entry.name.startsWith(`${INVENTORY_FILENAME}.`)) {
-        return {
-          filename: entry.name,
-          algorithm: entry.name.slice(INVENTORY_FILENAME.length + 1),
-        };
-      }
+  const entries = await backend.list(key) ?? [];
+  for (const entry of entries) {
+    if (
+      entry.kind === "file" && entry.name.startsWith(`${INVENTORY_FILENAME}.`)
+    ) {
+      return {
+        filename: entry.name,
+        algorithm: entry.name.slice(INVENTORY_FILENAME.length + 1),
+      };
     }
-  } catch (cause) {
-    if (!(cause instanceof Deno.errors.NotFound)) throw cause;
   }
   return null;
 }
@@ -192,16 +184,18 @@ export interface InventoryCheckResult {
 /**
  * Read an inventory and verify it against its sidecar, collecting issues.
  *
- * @param dir Directory containing `inventory.json`.
+ * @param key Storage-root-relative key of the directory holding
+ * `inventory.json`; `""` for the root itself.
  * @param location Path used in issue reporting, relative to the storage root.
  */
 export async function checkInventory(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
   location: string,
 ): Promise<InventoryCheckResult> {
-  const inventoryPath = `${dir}/${INVENTORY_FILENAME}`;
+  const inventoryKey = joinKey(key, INVENTORY_FILENAME);
   const inventoryLocation = joinOcflPath(location, INVENTORY_FILENAME);
-  const bytes = await readFileOrNull(inventoryPath);
+  const bytes = await backend.read(inventoryKey);
   if (bytes === null) {
     return {
       loaded: null,
@@ -214,9 +208,9 @@ export async function checkInventory(
   if (inventory === null) {
     return { loaded: null, issues, sidecarVerified: false };
   }
-  const loaded: LoadedInventory = { inventory, bytes, path: inventoryPath };
+  const loaded: LoadedInventory = { inventory, bytes, path: inventoryKey };
 
-  const sidecar = await findSidecar(dir);
+  const sidecar = await findSidecar(backend, key);
   if (sidecar === null) {
     issues.push(
       error(
@@ -242,7 +236,8 @@ export async function checkInventory(
     return { loaded, issues, sidecarVerified: false };
   }
 
-  const sidecarText = await Deno.readTextFile(`${dir}/${sidecar.filename}`);
+  const sidecarText = await readText(backend, joinKey(key, sidecar.filename)) ??
+    "";
   const parsed = parseSidecar(sidecarText, sidecarLocation);
   issues.push(...parsed.issues);
   if (parsed.digest === null) {
@@ -271,14 +266,16 @@ export async function checkInventory(
  * the validator uses {@link checkInventory}.
  */
 export async function readInventoryVerified(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
 ): Promise<LoadedInventory> {
-  const result = await checkInventory(dir, dir);
+  const where = joinKey(backend.url, key);
+  const result = await checkInventory(backend, key, where);
   if (result.loaded === null || !result.sidecarVerified) {
     const issue = result.issues[0];
     throw new OcflError(
-      issue?.message ?? `could not read a verified inventory in ${dir}`,
-      { code: issue?.code, path: dir },
+      issue?.message ?? `could not read a verified inventory in ${where}`,
+      { code: issue?.code, path: where },
     );
   }
   return result.loaded;
@@ -317,15 +314,31 @@ export function serializeInventory(inventory: Inventory): Uint8Array {
  * disk (E062).
  */
 export async function writeInventoryPair(
-  dir: string,
+  backend: StorageBackend,
+  key: string,
   bytes: Uint8Array,
   algorithm: DigestAlgorithm,
 ): Promise<void> {
-  await Deno.writeFile(`${dir}/${INVENTORY_FILENAME}`, bytes);
+  await backend.write(joinKey(key, INVENTORY_FILENAME), bytes);
+  await writeSidecar(backend, key, bytes, algorithm);
+}
+
+/**
+ * Write just the sidecar for already-written inventory bytes.
+ *
+ * Commit finalizers use this when a step must run between the inventory write
+ * and its sidecar — the sidecar is the commit marker (E062).
+ */
+export async function writeSidecar(
+  backend: StorageBackend,
+  key: string,
+  bytes: Uint8Array,
+  algorithm: DigestAlgorithm,
+): Promise<void> {
   const digest = digestBytes(bytes, algorithm);
-  await Deno.writeTextFile(
-    `${dir}/${sidecarFilename(algorithm)}`,
-    `${digest} ${INVENTORY_FILENAME}\n`,
+  await backend.write(
+    joinKey(key, sidecarFilename(algorithm)),
+    new TextEncoder().encode(`${digest} ${INVENTORY_FILENAME}\n`),
   );
 }
 

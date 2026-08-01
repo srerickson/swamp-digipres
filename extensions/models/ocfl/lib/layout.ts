@@ -10,6 +10,8 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import type { StorageBackend } from "./backend/backend.ts";
+import { joinKey, readText } from "./backend/backend.ts";
 import { OcflError } from "./errors.ts";
 import { digestBytes, isDigestAlgorithmSupported } from "./digest.ts";
 
@@ -98,22 +100,20 @@ export function hashedNTupleLayout(
 }
 
 /** Read a JSON file, returning `null` when it does not exist. */
-async function readJsonOrNull(path: string): Promise<unknown | null> {
-  let text: string;
-  try {
-    text = await Deno.readTextFile(path);
-  } catch (cause) {
-    if (cause instanceof Deno.errors.NotFound) return null;
-    throw cause;
-  }
+async function readJsonOrNull(
+  backend: StorageBackend,
+  key: string,
+): Promise<unknown | null> {
+  const text = await readText(backend, key);
+  if (text === null) return null;
   try {
     return JSON.parse(text);
   } catch (cause) {
     throw new OcflError(
-      `${path} is not valid JSON: ${
+      `${joinKey(backend.url, key)} is not valid JSON: ${
         cause instanceof Error ? cause.message : String(cause)
       }`,
-      { path },
+      { path: key },
     );
   }
 }
@@ -135,8 +135,10 @@ export interface LayoutResolution {
  * callers fall back to scanning. An unimplemented layout is likewise reported
  * rather than thrown, so `list` and `validate` still work on such roots.
  */
-export async function loadLayout(root: string): Promise<LayoutResolution> {
-  const declaration = await readJsonOrNull(`${root}/${LAYOUT_FILENAME}`);
+export async function loadLayout(
+  backend: StorageBackend,
+): Promise<LayoutResolution> {
+  const declaration = await readJsonOrNull(backend, LAYOUT_FILENAME);
   if (declaration === null) {
     return {
       layout: null,
@@ -149,7 +151,7 @@ export async function loadLayout(root: string): Promise<LayoutResolution> {
   if (!parsed.success) {
     throw new OcflError(
       `${LAYOUT_FILENAME} must contain an "extension" key naming a storage layout extension`,
-      { code: "E070", path: `${root}/${LAYOUT_FILENAME}` },
+      { code: "E070", path: LAYOUT_FILENAME },
     );
   }
   const extension = parsed.data.extension;
@@ -162,8 +164,8 @@ export async function loadLayout(root: string): Promise<LayoutResolution> {
     };
   }
 
-  const configPath = `${root}/${EXTENSIONS_DIRNAME}/${extension}/config.json`;
-  const rawConfig = await readJsonOrNull(configPath);
+  const configKey = `${EXTENSIONS_DIRNAME}/${extension}/config.json`;
+  const rawConfig = await readJsonOrNull(backend, configKey);
   const config = HashedNTupleConfigSchema.safeParse(
     rawConfig ?? { extensionName: extension },
   );
@@ -172,7 +174,7 @@ export async function loadLayout(root: string): Promise<LayoutResolution> {
       `invalid ${extension} config: ${
         config.error.issues.map((i) => i.message).join("; ")
       }`,
-      { path: configPath },
+      { path: configKey },
     );
   }
 
@@ -187,8 +189,6 @@ export async function loadLayout(root: string): Promise<LayoutResolution> {
 export interface DiscoveredObject {
   /** Path relative to the storage root, using `/` separators. */
   relativePath: string;
-  /** Absolute path on disk. */
-  absolutePath: string;
 }
 
 /**
@@ -202,36 +202,33 @@ export interface DiscoveredObject {
  * object" pass, so it works with or without a declared layout.
  */
 export async function scanObjectRoots(
-  root: string,
+  backend: StorageBackend,
 ): Promise<DiscoveredObject[]> {
   const found: DiscoveredObject[] = [];
 
-  async function walk(absolute: string, relative: string): Promise<void> {
+  async function walk(relative: string): Promise<void> {
     const subdirectories: string[] = [];
     let isObjectRoot = false;
-    for await (const entry of Deno.readDir(absolute)) {
-      if (entry.isFile && entry.name.startsWith("0=ocfl_object_")) {
+    for (const entry of await backend.list(relative) ?? []) {
+      if (entry.kind === "file" && entry.name.startsWith("0=ocfl_object_")) {
         isObjectRoot = true;
-      } else if (entry.isDirectory) {
+      } else if (entry.kind === "dir") {
         subdirectories.push(entry.name);
       }
     }
 
     if (isObjectRoot) {
-      found.push({ relativePath: relative, absolutePath: absolute });
+      found.push({ relativePath: relative });
       return;
     }
 
     for (const name of subdirectories) {
       if (relative === "" && name === EXTENSIONS_DIRNAME) continue;
-      await walk(
-        `${absolute}/${name}`,
-        relative === "" ? name : `${relative}/${name}`,
-      );
+      await walk(joinKey(relative, name));
     }
   }
 
-  await walk(root, "");
+  await walk("");
   found.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
   return found;
 }

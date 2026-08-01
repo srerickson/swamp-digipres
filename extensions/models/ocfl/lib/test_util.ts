@@ -7,11 +7,21 @@
  * @module
  */
 
+import type { StorageBackend } from "./backend/backend.ts";
+import { joinKey } from "./backend/backend.ts";
+import { LocalBackend } from "./backend/local.ts";
+import { MemoryBackend } from "./backend/memory.ts";
+
 /** Absolute path to the checked-in read-only fixture storage root. */
 export const FIXTURE_ROOT = new URL(
   "../../../../testdata/fixtures/ocfl-root",
   import.meta.url,
 ).pathname;
+
+/** A backend over the checked-in read-only fixture storage root. */
+export function fixtureBackend(): LocalBackend {
+  return new LocalBackend(FIXTURE_ROOT);
+}
 
 /** Object ids present in the fixture root. */
 export const FIXTURE_IDS = {
@@ -73,4 +83,85 @@ export async function withTempDir(
   } finally {
     await Deno.remove(temp, { recursive: true });
   }
+}
+
+/** Backend families the parametrized suite runs against. */
+export type BackendKind = "local" | "memory";
+
+/** Every backend family, for `for`-loops around `Deno.test`. */
+export const BACKEND_KINDS: readonly BackendKind[] = ["local", "memory"];
+
+/** Load every file under a local directory into a backend. */
+export async function loadTreeIntoBackend(
+  backend: StorageBackend,
+  sourceDir: string,
+  prefix = "",
+): Promise<void> {
+  for await (const entry of Deno.readDir(sourceDir)) {
+    const source = `${sourceDir}/${entry.name}`;
+    const key = joinKey(prefix, entry.name);
+    if (entry.isDirectory) {
+      await loadTreeIntoBackend(backend, source, key);
+    } else if (entry.isFile) {
+      await backend.write(key, await Deno.readFile(source));
+    }
+  }
+}
+
+/**
+ * Run a test body against a disposable, mutable copy of the fixture root on
+ * the requested backend family.
+ */
+export async function withFixtureBackend(
+  kind: BackendKind,
+  body: (backend: StorageBackend) => Promise<void>,
+): Promise<void> {
+  if (kind === "local") {
+    await withFixtureCopy(async (root) => {
+      await body(new LocalBackend(root));
+    });
+    return;
+  }
+  const backend = new MemoryBackend();
+  await loadTreeIntoBackend(backend, FIXTURE_ROOT);
+  await body(backend);
+}
+
+/** Run a test body against an empty backend of the requested family. */
+export async function withEmptyBackend(
+  kind: BackendKind,
+  body: (backend: StorageBackend) => Promise<void>,
+): Promise<void> {
+  if (kind === "local") {
+    await withTempDir(async (dir) => {
+      await body(new LocalBackend(dir));
+    });
+    return;
+  }
+  await body(new MemoryBackend());
+}
+
+/**
+ * Move every key under one prefix to another, backend-generically. The
+ * test-suite substitute for directory renames.
+ */
+export async function movePrefix(
+  backend: StorageBackend,
+  from: string,
+  to: string,
+): Promise<void> {
+  async function walk(fromKey: string, toKey: string): Promise<void> {
+    for (const entry of await backend.list(fromKey) ?? []) {
+      const source = joinKey(fromKey, entry.name);
+      const target = joinKey(toKey, entry.name);
+      if (entry.kind === "dir") {
+        await walk(source, target);
+      } else {
+        const data = await backend.read(source);
+        if (data !== null) await backend.write(target, data);
+      }
+    }
+  }
+  await walk(from, to);
+  await backend.deletePrefix(from);
 }

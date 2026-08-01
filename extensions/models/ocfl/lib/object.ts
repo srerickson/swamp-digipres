@@ -6,10 +6,11 @@
  *
  * @module
  */
+import type { StorageBackend } from "./backend/backend.ts";
 import { OcflError } from "./errors.ts";
 import { normalizeDigest } from "./digest.ts";
 import { readInventoryVerified } from "./inventory.ts";
-import type { DiscoveredObject, StorageLayout } from "./layout.ts";
+import type { StorageLayout } from "./layout.ts";
 import { loadLayout, scanObjectRoots } from "./layout.ts";
 import { readNamaste } from "./namaste.ts";
 import type { Inventory, Version } from "./types.ts";
@@ -18,7 +19,9 @@ import { sortVersionNames } from "./version.ts";
 
 /** An opened OCFL storage root. */
 export interface StorageRoot {
-  /** Absolute path to the storage root. */
+  /** Backend holding the root's contents. */
+  backend: StorageBackend;
+  /** Display form of the root: an absolute path or `s3://bucket/prefix`. */
   path: string;
   /** OCFL specification version declared by the root, e.g. `"1.1"`. */
   specVersion: string;
@@ -32,8 +35,6 @@ export interface OcflObject {
   id: string;
   /** Object root path relative to the storage root. */
   relativePath: string;
-  /** Absolute object root path. */
-  absolutePath: string;
   /** The verified root inventory. */
   inventory: Inventory;
   /** Exact bytes of the root inventory. */
@@ -44,43 +45,36 @@ export interface OcflObject {
  * Open a storage root: verify its conformance declaration and resolve its
  * storage layout.
  */
-export async function openStorageRoot(path: string): Promise<StorageRoot> {
-  const namaste = await readNamaste(path, "root");
+export async function openStorageRoot(
+  backend: StorageBackend,
+): Promise<StorageRoot> {
+  const namaste = await readNamaste(backend, "", "root");
   if (namaste.version !== "1.1" && namaste.version !== "1.0") {
     throw new OcflError(
       `unsupported OCFL specification version in storage root: ${namaste.version}`,
-      { path },
+      { path: backend.url },
     );
   }
-  const { layout } = await loadLayout(path);
-  return { path, specVersion: namaste.version, layout };
+  const { layout } = await loadLayout(backend);
+  return { backend, path: backend.url, specVersion: namaste.version, layout };
 }
 
-/** Read the object rooted at an absolute path, verifying its declaration. */
+/** Read the object rooted at a key, verifying its declaration. */
 async function readObjectAt(
-  discovered: DiscoveredObject,
+  backend: StorageBackend,
+  relativePath: string,
 ): Promise<OcflObject> {
-  await readNamaste(discovered.absolutePath, "object");
+  await readNamaste(backend, relativePath, "object");
   const { inventory, bytes } = await readInventoryVerified(
-    discovered.absolutePath,
+    backend,
+    relativePath,
   );
   return {
     id: inventory.id,
-    relativePath: discovered.relativePath,
-    absolutePath: discovered.absolutePath,
+    relativePath,
     inventory,
     inventoryBytes: bytes,
   };
-}
-
-/** Whether a path exists and is a directory. */
-async function isDirectory(path: string): Promise<boolean> {
-  try {
-    return (await Deno.stat(path)).isDirectory;
-  } catch (cause) {
-    if (cause instanceof Deno.errors.NotFound) return false;
-    throw cause;
-  }
 }
 
 /**
@@ -98,9 +92,8 @@ export async function locateObject(
 ): Promise<OcflObject | null> {
   if (root.layout !== null) {
     const relativePath = root.layout.resolve(id);
-    const absolutePath = `${root.path}/${relativePath}`;
-    if (!(await isDirectory(absolutePath))) return null;
-    const object = await readObjectAt({ relativePath, absolutePath });
+    if (!(await root.backend.prefixExists(relativePath))) return null;
+    const object = await readObjectAt(root.backend, relativePath);
     if (object.id !== id) {
       throw new OcflError(
         `object at ${relativePath} declares id ${
@@ -112,8 +105,8 @@ export async function locateObject(
     return object;
   }
 
-  for (const discovered of await scanObjectRoots(root.path)) {
-    const object = await readObjectAt(discovered);
+  for (const discovered of await scanObjectRoots(root.backend)) {
+    const object = await readObjectAt(root.backend, discovered.relativePath);
     if (object.id === id) return object;
   }
   return null;
@@ -135,10 +128,10 @@ export async function requireObject(
 
 /** Read every object in the storage root, ordered by path. */
 export async function listObjects(root: StorageRoot): Promise<OcflObject[]> {
-  const discovered = await scanObjectRoots(root.path);
+  const discovered = await scanObjectRoots(root.backend);
   const objects: OcflObject[] = [];
   for (const entry of discovered) {
-    objects.push(await readObjectAt(entry));
+    objects.push(await readObjectAt(root.backend, entry.relativePath));
   }
   return objects;
 }
@@ -213,12 +206,12 @@ export function versionFileCount(
   );
 }
 
-/** Absolute path of a content path within an object. */
-export function contentPathToAbsolute(
+/** Storage-root-relative key of a content path within an object. */
+export function contentPathKey(
   object: OcflObject,
   contentPath: string,
 ): string {
-  return `${object.absolutePath}/${contentPath}`;
+  return `${object.relativePath}/${contentPath}`;
 }
 
 /** The content directory name in use for an object (§3.3.1). */

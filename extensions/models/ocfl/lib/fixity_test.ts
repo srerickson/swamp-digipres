@@ -4,6 +4,7 @@ import { digestBytes } from "./digest.ts";
 import { serializeInventory, writeInventoryPair } from "./inventory.ts";
 import { openStorageRoot, requireObject } from "./object.ts";
 import { validateObject, validateStorageRoot } from "./validate.ts";
+import { LocalBackend } from "./backend/local.ts";
 import { withTempDir } from "./test_util.ts";
 
 const USER = { name: "Fixity Test", address: "mailto:fixity@example.com" };
@@ -21,11 +22,11 @@ async function withObject(
   await withTempDir(async (dir) => {
     const rootPath = `${dir}/root`;
     const source = `${dir}/src`;
-    await initStorageRoot(rootPath);
+    await initStorageRoot(new LocalBackend(rootPath));
     await Deno.mkdir(source, { recursive: true });
     await Deno.writeTextFile(`${source}/a.txt`, contents);
 
-    await commit(await openStorageRoot(rootPath), {
+    await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:fixity:one",
       sourcePath: source,
       message: "Ingest",
@@ -34,12 +35,12 @@ async function withObject(
     });
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:fixity:one",
     );
     await body({
       rootPath,
-      objectPath: object.absolutePath,
+      objectPath: `${rootPath}/${object.relativePath}`,
       fixity: object.inventory.fixity,
     });
   });
@@ -55,7 +56,7 @@ Deno.test("commit records requested fixity algorithms for new content", async ()
       "v1/content/a.txt",
     ]);
 
-    const result = await validateStorageRoot(rootPath, { fullFixity: true });
+    const result = await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true });
     assertEquals(result.valid, true);
     assertEquals(result.objects[0].errors, []);
   });
@@ -77,7 +78,7 @@ Deno.test("blake2b-512 and sha512/256 fixity round-trip", async () => {
         ["v1/content/a.txt"],
       );
       assertEquals(
-        (await validateStorageRoot(rootPath, { fullFixity: true })).valid,
+        (await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true })).valid,
         true,
       );
     },
@@ -95,12 +96,13 @@ Deno.test("a corrupted fixity digest is caught by full fixity only (E093)", asyn
     md5["0".repeat(32)] = paths;
 
     const bytes = serializeInventory(inventory);
-    await writeInventoryPair(objectPath, bytes, "sha512");
-    await writeInventoryPair(`${objectPath}/v1`, bytes, "sha512");
+    const backend = new LocalBackend(objectPath);
+    await writeInventoryPair(backend, "", bytes, "sha512");
+    await writeInventoryPair(backend, "v1", bytes, "sha512");
 
-    assertEquals((await validateObject(objectPath, "object")).errors, []);
+    assertEquals((await validateObject(backend, "")).errors, []);
 
-    const fixity = await validateObject(objectPath, "object", {
+    const fixity = await validateObject(backend, "", {
       fullFixity: true,
     });
     assertEquals(fixity.errors.map((issue) => issue.code), ["E093"]);
@@ -120,10 +122,11 @@ Deno.test("an unsupported fixity algorithm is warned, not failed (E028)", async 
       "some-future-algorithm": { "abcdef": ["v1/content/a.txt"] },
     };
     const bytes = serializeInventory(inventory);
-    await writeInventoryPair(objectPath, bytes, "sha512");
-    await writeInventoryPair(`${objectPath}/v1`, bytes, "sha512");
+    const backend = new LocalBackend(objectPath);
+    await writeInventoryPair(backend, "", bytes, "sha512");
+    await writeInventoryPair(backend, "v1", bytes, "sha512");
 
-    const result = await validateObject(objectPath, "object", {
+    const result = await validateObject(backend, "", {
       fullFixity: true,
     });
     assertEquals(result.errors, []);
@@ -138,10 +141,11 @@ Deno.test("a fixity path that does not exist is flagged (E093)", async () => {
     );
     inventory.fixity = { md5: { "abcdef": ["v1/content/gone.txt"] } };
     const bytes = serializeInventory(inventory);
-    await writeInventoryPair(objectPath, bytes, "sha512");
-    await writeInventoryPair(`${objectPath}/v1`, bytes, "sha512");
+    const backend = new LocalBackend(objectPath);
+    await writeInventoryPair(backend, "", bytes, "sha512");
+    await writeInventoryPair(backend, "v1", bytes, "sha512");
 
-    const result = await validateObject(objectPath, "object", {
+    const result = await validateObject(backend, "", {
       fullFixity: true,
     });
     assertEquals(result.errors.map((issue) => issue.code), ["E093"]);
@@ -152,10 +156,10 @@ Deno.test("fixity entries accumulate across versions", async () => {
   await withTempDir(async (dir) => {
     const rootPath = `${dir}/root`;
     const source = `${dir}/src`;
-    await initStorageRoot(rootPath);
+    await initStorageRoot(new LocalBackend(rootPath));
     await Deno.mkdir(source, { recursive: true });
     await Deno.writeTextFile(`${source}/a.txt`, "one\n");
-    await commit(await openStorageRoot(rootPath), {
+    await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:fixity:multi",
       sourcePath: source,
       user: USER,
@@ -163,7 +167,7 @@ Deno.test("fixity entries accumulate across versions", async () => {
     });
 
     await Deno.writeTextFile(`${source}/b.txt`, "two\n");
-    await commit(await openStorageRoot(rootPath), {
+    await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:fixity:multi",
       sourcePath: source,
       user: USER,
@@ -171,7 +175,7 @@ Deno.test("fixity entries accumulate across versions", async () => {
     });
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:fixity:multi",
     );
     const md5 = object.inventory.fixity!.md5;
@@ -180,7 +184,7 @@ Deno.test("fixity entries accumulate across versions", async () => {
       "v2/content/b.txt",
     ]);
     assertEquals(
-      (await validateStorageRoot(rootPath, { fullFixity: true })).valid,
+      (await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true })).valid,
       true,
     );
   });
@@ -190,13 +194,13 @@ Deno.test("commit rejects an unsupported fixity algorithm", async () => {
   await withTempDir(async (dir) => {
     const rootPath = `${dir}/root`;
     const source = `${dir}/src`;
-    await initStorageRoot(rootPath);
+    await initStorageRoot(new LocalBackend(rootPath));
     await Deno.mkdir(source, { recursive: true });
     await Deno.writeTextFile(`${source}/a.txt`, "one\n");
 
     await assertRejects(
       async () =>
-        commit(await openStorageRoot(rootPath), {
+        commit(await openStorageRoot(new LocalBackend(rootPath)), {
           id: "urn:fixity:bad",
           sourcePath: source,
           user: USER,

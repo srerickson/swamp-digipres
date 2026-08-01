@@ -6,7 +6,14 @@ import { openStorageRoot, requireObject } from "./object.ts";
 import type { StorageRoot } from "./object.ts";
 import { validateObject, validateStorageRoot } from "./validate.ts";
 import { RFC3339_PATTERN } from "./types.ts";
-import { withTempDir } from "./test_util.ts";
+import { readText } from "./backend/backend.ts";
+import { LocalBackend } from "./backend/local.ts";
+import { MemoryBackend } from "./backend/memory.ts";
+import {
+  BACKEND_KINDS,
+  withEmptyBackend,
+  withTempDir,
+} from "./test_util.ts";
 
 const USER = { name: "Test Runner", address: "mailto:test@example.com" };
 
@@ -24,14 +31,19 @@ async function writeTree(
   return base;
 }
 
+/** Absolute object root path for a local storage root. */
+function objPath(rootPath: string, object: { relativePath: string }): string {
+  return `${rootPath}/${object.relativePath}`;
+}
+
 /** Set up an initialized storage root plus a scratch source directory. */
 async function withRoot(
   body: (root: StorageRoot, source: string, rootPath: string) => Promise<void>,
 ): Promise<void> {
   await withTempDir(async (dir) => {
     const rootPath = `${dir}/root`;
-    await initStorageRoot(rootPath);
-    const root = await openStorageRoot(rootPath);
+    await initStorageRoot(new LocalBackend(rootPath));
+    const root = await openStorageRoot(new LocalBackend(rootPath));
     await Deno.mkdir(`${dir}/src`, { recursive: true });
     await body(root, `${dir}/src`, rootPath);
   });
@@ -62,12 +74,12 @@ Deno.test("nowRfc3339 emits second-granularity UTC (E049)", () => {
 Deno.test("initStorageRoot produces a valid, empty storage root", async () => {
   await withTempDir(async (dir) => {
     const rootPath = `${dir}/root`;
-    await initStorageRoot(rootPath);
-    const result = await validateStorageRoot(rootPath);
+    await initStorageRoot(new LocalBackend(rootPath));
+    const result = await validateStorageRoot(new LocalBackend(rootPath));
     assertEquals(result.rootErrors, []);
     assertEquals(result.objects.length, 0);
 
-    const root = await openStorageRoot(rootPath);
+    const root = await openStorageRoot(new LocalBackend(rootPath));
     assertEquals(root.specVersion, "1.1");
     assertEquals(root.layout?.name, "0004-hashed-n-tuple-storage-layout");
   });
@@ -76,7 +88,7 @@ Deno.test("initStorageRoot produces a valid, empty storage root", async () => {
 Deno.test("initStorageRoot refuses a non-empty directory", async () => {
   await withTempDir(async (dir) => {
     await Deno.writeTextFile(`${dir}/existing.txt`, "hello\n");
-    await assertRejects(() => initStorageRoot(dir));
+    await assertRejects(() => initStorageRoot(new LocalBackend(dir)));
   });
 });
 
@@ -96,7 +108,7 @@ Deno.test("ingest creates a self-validating v1 object", async () => {
     assertEquals(result.addedPaths, ["notes/a.txt", "spec.md"]);
     assertEquals(result.newContentCount, 2);
 
-    const validation = await validateStorageRoot(rootPath, {
+    const validation = await validateStorageRoot(new LocalBackend(rootPath), {
       fullFixity: true,
     });
     assertEquals(validation.valid, true);
@@ -106,7 +118,7 @@ Deno.test("ingest creates a self-validating v1 object", async () => {
     }
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:alpha",
     );
     assertEquals(object.inventory.head, "v1");
@@ -122,14 +134,14 @@ Deno.test("the root inventory is a byte copy of the head version's (E064)", asyn
     await commit(root, { id: "urn:test:beta", sourcePath: source, user: USER });
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:beta",
     );
     const rootBytes = await Deno.readFile(
-      `${object.absolutePath}/inventory.json`,
+      `${objPath(rootPath, object)}/inventory.json`,
     );
     const versionBytes = await Deno.readFile(
-      `${object.absolutePath}/v1/inventory.json`,
+      `${objPath(rootPath, object)}/v1/inventory.json`,
     );
     assertEquals(bytesEqual(rootBytes, versionBytes), true);
   });
@@ -140,9 +152,9 @@ Deno.test("adding a file produces v2 and leaves v1 untouched", async () => {
     await writeTree(source, { "a.txt": "one\n" });
     await commit(root, { id: "urn:test:add", sourcePath: source, user: USER });
 
-    const reopened = await openStorageRoot(rootPath);
+    const reopened = await openStorageRoot(new LocalBackend(rootPath));
     const object = await requireObject(reopened, "urn:test:add");
-    const before = await snapshotTree(`${object.absolutePath}/v1`);
+    const before = await snapshotTree(`${objPath(rootPath, object)}/v1`);
 
     await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
     const result = await commit(reopened, {
@@ -161,9 +173,9 @@ Deno.test("adding a file produces v2 and leaves v1 untouched", async () => {
     assertEquals(result.newContentCount, 1);
 
     // Invariant 1: version directories are immutable.
-    assertEquals(await snapshotTree(`${object.absolutePath}/v1`), before);
+    assertEquals(await snapshotTree(`${objPath(rootPath, object)}/v1`), before);
     assertEquals(
-      (await validateStorageRoot(rootPath, { fullFixity: true })).valid,
+      (await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true })).valid,
       true,
     );
   });
@@ -175,7 +187,7 @@ Deno.test("modifying a file writes new content and keeps the old", async () => {
     await commit(root, { id: "urn:test:mod", sourcePath: source, user: USER });
 
     await writeTree(source, { "a.txt": "one modified\n" });
-    const result = await commit(await openStorageRoot(rootPath), {
+    const result = await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:test:mod",
       sourcePath: source,
       message: "Modify a.txt",
@@ -186,20 +198,20 @@ Deno.test("modifying a file writes new content and keeps the old", async () => {
     assertEquals(result.newContentCount, 1);
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:mod",
     );
     assertEquals(Object.keys(object.inventory.manifest).length, 2);
     assertEquals(
-      await Deno.readTextFile(`${object.absolutePath}/v1/content/a.txt`),
+      await Deno.readTextFile(`${objPath(rootPath, object)}/v1/content/a.txt`),
       "one\n",
     );
     assertEquals(
-      await Deno.readTextFile(`${object.absolutePath}/v2/content/a.txt`),
+      await Deno.readTextFile(`${objPath(rootPath, object)}/v2/content/a.txt`),
       "one modified\n",
     );
     assertEquals(
-      (await validateStorageRoot(rootPath, { fullFixity: true })).valid,
+      (await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true })).valid,
       true,
     );
   });
@@ -215,7 +227,7 @@ Deno.test("unchanged content is deduplicated, writing no new content file", asyn
     });
 
     await writeTree(source, { "keep.txt": "same\n", "new.txt": "different\n" });
-    const result = await commit(await openStorageRoot(rootPath), {
+    const result = await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:test:dedup",
       sourcePath: source,
       user: USER,
@@ -224,10 +236,10 @@ Deno.test("unchanged content is deduplicated, writing no new content file", asyn
     assertEquals(result.newContentCount, 1);
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:dedup",
     );
-    const v2Content = await snapshotTree(`${object.absolutePath}/v2/content`);
+    const v2Content = await snapshotTree(`${objPath(rootPath, object)}/v2/content`);
     assertEquals(Object.keys(v2Content), ["new.txt"]);
 
     // The unchanged file still resolves, via v1's content path.
@@ -238,7 +250,7 @@ Deno.test("unchanged content is deduplicated, writing no new content file", asyn
     assertEquals(object.inventory.manifest[keepDigest], [
       "v1/content/keep.txt",
     ]);
-    assertEquals((await validateStorageRoot(rootPath)).valid, true);
+    assertEquals((await validateStorageRoot(new LocalBackend(rootPath))).valid, true);
   });
 });
 
@@ -253,7 +265,7 @@ Deno.test("two staged files with identical content share one content file", asyn
 
     assertEquals(result.newContentCount, 1);
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:twins",
     );
     assertEquals(Object.keys(object.inventory.manifest).length, 1);
@@ -261,7 +273,7 @@ Deno.test("two staged files with identical content share one content file", asyn
       "one.txt",
       "two.txt",
     ]);
-    assertEquals((await validateStorageRoot(rootPath)).valid, true);
+    assertEquals((await validateStorageRoot(new LocalBackend(rootPath))).valid, true);
   });
 });
 
@@ -275,13 +287,13 @@ Deno.test("prior version blocks are carried forward unchanged (E066/W011)", asyn
       user: USER,
     });
     const first = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:carry",
     );
     const v1Block = structuredClone(first.inventory.versions.v1);
 
     await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
-    await commit(await openStorageRoot(rootPath), {
+    await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:test:carry",
       sourcePath: source,
       message: "second",
@@ -292,7 +304,7 @@ Deno.test("prior version blocks are carried forward unchanged (E066/W011)", asyn
       "b.txt": "two\n",
       "c.txt": "three\n",
     });
-    await commit(await openStorageRoot(rootPath), {
+    await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:test:carry",
       sourcePath: source,
       message: "third",
@@ -300,12 +312,12 @@ Deno.test("prior version blocks are carried forward unchanged (E066/W011)", asyn
     });
 
     const third = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:carry",
     );
     assertEquals(third.inventory.head, "v3");
     assertEquals(third.inventory.versions.v1, v1Block);
-    assertEquals((await validateStorageRoot(rootPath)).valid, true);
+    assertEquals((await validateStorageRoot(new LocalBackend(rootPath))).valid, true);
   });
 });
 
@@ -316,7 +328,7 @@ Deno.test("a no-op commit is refused", async () => {
 
     await assertRejects(
       async () =>
-        commit(await openStorageRoot(rootPath), {
+        commit(await openStorageRoot(new LocalBackend(rootPath)), {
           id: "urn:test:noop",
           sourcePath: source,
           user: USER,
@@ -326,7 +338,7 @@ Deno.test("a no-op commit is refused", async () => {
     );
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:noop",
     );
     assertEquals(object.inventory.head, "v1");
@@ -341,7 +353,7 @@ Deno.test("a commit that drops a path is refused without allowDeletes", async ()
     await writeTree(source, { "a.txt": "one\n" });
     await assertRejects(
       async () =>
-        commit(await openStorageRoot(rootPath), {
+        commit(await openStorageRoot(new LocalBackend(rootPath)), {
           id: "urn:test:del",
           sourcePath: source,
           user: USER,
@@ -351,12 +363,12 @@ Deno.test("a commit that drops a path is refused without allowDeletes", async ()
     );
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:del",
     );
     assertEquals(object.inventory.head, "v1");
     assertEquals(
-      await Deno.readTextFile(`${object.absolutePath}/v1/content/b.txt`),
+      await Deno.readTextFile(`${objPath(rootPath, object)}/v1/content/b.txt`),
       "two\n",
     );
   });
@@ -372,7 +384,7 @@ Deno.test("allowDeletes performs an OCFL logical deletion", async () => {
     });
 
     await writeTree(source, { "a.txt": "one\n" });
-    const result = await commit(await openStorageRoot(rootPath), {
+    const result = await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:test:logdel",
       sourcePath: source,
       message: "Remove b.txt",
@@ -382,7 +394,7 @@ Deno.test("allowDeletes performs an OCFL logical deletion", async () => {
     assertEquals(result.deletedPaths, ["b.txt"]);
 
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:logdel",
     );
     const v2Paths = Object.values(object.inventory.versions.v2.state).flat();
@@ -393,12 +405,12 @@ Deno.test("allowDeletes performs an OCFL logical deletion", async () => {
       .sort();
     assertEquals(v1Paths, ["a.txt", "b.txt"]);
     assertEquals(
-      await Deno.readTextFile(`${object.absolutePath}/v1/content/b.txt`),
+      await Deno.readTextFile(`${objPath(rootPath, object)}/v1/content/b.txt`),
       "two\n",
     );
     assertEquals(Object.keys(object.inventory.manifest).length, 2);
     assertEquals(
-      (await validateStorageRoot(rootPath, { fullFixity: true })).valid,
+      (await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true })).valid,
       true,
     );
   });
@@ -417,7 +429,7 @@ Deno.test("committing an empty source tree to an existing object needs allowDele
     await Deno.mkdir(source, { recursive: true });
     await assertRejects(
       async () =>
-        commit(await openStorageRoot(rootPath), {
+        commit(await openStorageRoot(new LocalBackend(rootPath)), {
           id: "urn:test:empty",
           sourcePath: source,
           user: USER,
@@ -480,15 +492,15 @@ Deno.test("commit follows a zero-padded version convention", async () => {
 
     // Rewrite the object to use v0001 naming, as another implementation might.
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:padded",
     );
     await Deno.rename(
-      `${object.absolutePath}/v1`,
-      `${object.absolutePath}/v0001`,
+      `${objPath(rootPath, object)}/v1`,
+      `${objPath(rootPath, object)}/v0001`,
     );
     const inventory = JSON.parse(
-      await Deno.readTextFile(`${object.absolutePath}/inventory.json`),
+      await Deno.readTextFile(`${objPath(rootPath, object)}/inventory.json`),
     );
     const text = JSON.stringify(inventory)
       .replaceAll('"v1"', '"v0001"')
@@ -498,19 +510,20 @@ Deno.test("commit follows a zero-padded version convention", async () => {
       "./inventory.ts"
     );
     const bytes = serializeInventory(rewritten);
-    await writeInventoryPair(object.absolutePath, bytes, "sha512");
-    await writeInventoryPair(`${object.absolutePath}/v0001`, bytes, "sha512");
-    assertEquals((await validateStorageRoot(rootPath)).objects[0].errors, []);
+    const objectBackend = new LocalBackend(objPath(rootPath, object));
+    await writeInventoryPair(objectBackend, "", bytes, "sha512");
+    await writeInventoryPair(objectBackend, "v0001", bytes, "sha512");
+    assertEquals((await validateStorageRoot(new LocalBackend(rootPath))).objects[0].errors, []);
 
     await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
-    const result = await commit(await openStorageRoot(rootPath), {
+    const result = await commit(await openStorageRoot(new LocalBackend(rootPath)), {
       id: "urn:test:padded",
       sourcePath: source,
       user: USER,
     });
     assertEquals(result.head, "v0002");
     assertEquals(
-      (await validateStorageRoot(rootPath, { fullFixity: true })).valid,
+      (await validateStorageRoot(new LocalBackend(rootPath), { fullFixity: true })).valid,
       true,
     );
   });
@@ -521,9 +534,9 @@ Deno.test("a head that moves during staging aborts the commit", async () => {
     await writeTree(source, { "a.txt": "one\n" });
     await commit(root, { id: "urn:test:race", sourcePath: source, user: USER });
 
-    const reopened = await openStorageRoot(rootPath);
+    const reopened = await openStorageRoot(new LocalBackend(rootPath));
     const object = await requireObject(reopened, "urn:test:race");
-    const beforeRace = await snapshotTree(object.absolutePath);
+    const beforeRace = await snapshotTree(objPath(rootPath, object));
 
     await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
     const conflict = await assertRejects(
@@ -537,7 +550,7 @@ Deno.test("a head that moves during staging aborts the commit", async () => {
             // Simulate a concurrent writer landing v2 first.
             const other = `${source}-other`;
             await writeTree(other, { "a.txt": "one\n", "c.txt": "three\n" });
-            await commit(await openStorageRoot(rootPath), {
+            await commit(await openStorageRoot(new LocalBackend(rootPath)), {
               id: "urn:test:race",
               sourcePath: other,
               user: USER,
@@ -550,7 +563,7 @@ Deno.test("a head that moves during staging aborts the commit", async () => {
 
     // The losing commit wrote nothing of its own; the winner's v2 stands.
     const after = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:race",
     );
     assertEquals(after.inventory.head, "v2");
@@ -558,7 +571,7 @@ Deno.test("a head that moves during staging aborts the commit", async () => {
       .sort();
     assertEquals(v2Paths, ["a.txt", "c.txt"]);
     assertEquals(Object.keys(beforeRace).length > 0, true);
-    assertEquals((await validateStorageRoot(rootPath)).valid, true);
+    assertEquals((await validateStorageRoot(new LocalBackend(rootPath))).valid, true);
   });
 });
 
@@ -573,7 +586,7 @@ Deno.test("a crash after moving the version directory leaves the old head readab
 
     await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
     await assertRejects(async () =>
-      commit(await openStorageRoot(rootPath), {
+      commit(await openStorageRoot(new LocalBackend(rootPath)), {
         id: "urn:test:crash",
         sourcePath: source,
         user: USER,
@@ -585,12 +598,12 @@ Deno.test("a crash after moving the version directory leaves the old head readab
 
     // The root inventory still describes v1 and still verifies.
     const object = await requireObject(
-      await openStorageRoot(rootPath),
+      await openStorageRoot(new LocalBackend(rootPath)),
       "urn:test:crash",
     );
     assertEquals(object.inventory.head, "v1");
     assertEquals(
-      await Deno.readTextFile(`${object.absolutePath}/v1/content/a.txt`),
+      await Deno.readTextFile(`${objPath(rootPath, object)}/v1/content/a.txt`),
       "one\n",
     );
   });
@@ -607,7 +620,7 @@ Deno.test("a crash between root inventory and sidecar is reported as recoverable
 
     await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
     await assertRejects(async () =>
-      commit(await openStorageRoot(rootPath), {
+      commit(await openStorageRoot(new LocalBackend(rootPath)), {
         id: "urn:test:window",
         sourcePath: source,
         user: USER,
@@ -620,7 +633,7 @@ Deno.test("a crash between root inventory and sidecar is reported as recoverable
     );
 
     const objectPath = `${rootPath}/${root.layout!.resolve("urn:test:window")}`;
-    const result = await validateObject(objectPath, "object");
+    const result = await validateObject(new LocalBackend(objectPath), "");
     assertEquals(result.valid, false);
     assertEquals(result.errors.map((issue) => issue.code), ["E060"]);
     assertEquals(result.recoverable, true);
@@ -675,5 +688,375 @@ Deno.test("commit refuses when an intermediate directory holds a file (E084)", a
       Error,
       "intermediate directories",
     );
+  });
+});
+
+/**
+ * Set up an initialized storage root on the requested backend family plus a
+ * local scratch source directory (source trees are always local).
+ */
+async function withBackendRoot(
+  kind: (typeof BACKEND_KINDS)[number],
+  body: (root: StorageRoot, source: string) => Promise<void>,
+): Promise<void> {
+  await withTempDir(async (dir) => {
+    await withEmptyBackend(kind, async (backend) => {
+      await initStorageRoot(backend);
+      const root = await openStorageRoot(backend);
+      const source = `${dir}/src`;
+      await Deno.mkdir(source, { recursive: true });
+      await body(root, source);
+    });
+  });
+}
+
+/** Reopen a storage root from its backend. */
+function reopen(root: StorageRoot): Promise<StorageRoot> {
+  return openStorageRoot(root.backend);
+}
+
+for (const kind of BACKEND_KINDS) {
+  Deno.test(`[${kind}] ingest and update produce fully valid versions`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      await writeTree(source, { "a.txt": "one\n", "docs/b.txt": "two\n" });
+      const first = await commit(root, {
+        id: "urn:bk:obj",
+        sourcePath: source,
+        message: "Ingest",
+        user: USER,
+      });
+      assertEquals(first.created, true);
+      assertEquals(first.head, "v1");
+
+      await writeTree(source, {
+        "a.txt": "one\n",
+        "docs/b.txt": "two changed\n",
+      });
+      const second = await commit(await reopen(root), {
+        id: "urn:bk:obj",
+        sourcePath: source,
+        message: "Change b",
+        user: USER,
+      });
+      assertEquals(second.created, false);
+      assertEquals(second.head, "v2");
+      assertEquals(second.modifiedPaths, ["docs/b.txt"]);
+
+      const validation = await validateStorageRoot(root.backend, {
+        fullFixity: true,
+      });
+      assertEquals(validation.rootErrors, []);
+      for (const object of validation.objects) {
+        assertEquals(object.errors, [], object.path);
+        assertEquals(object.warnings, [], object.path);
+      }
+      assertEquals(validation.valid, true);
+    });
+  });
+
+  Deno.test(`[${kind}] unchanged content is deduplicated across versions`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      await writeTree(source, { "keep.txt": "same\n" });
+      await commit(root, { id: "urn:bk:dedup", sourcePath: source, user: USER });
+
+      await writeTree(source, { "keep.txt": "same\n", "new.txt": "diff\n" });
+      const result = await commit(await reopen(root), {
+        id: "urn:bk:dedup",
+        sourcePath: source,
+        user: USER,
+      });
+      assertEquals(result.newContentCount, 1);
+
+      const object = await requireObject(await reopen(root), "urn:bk:dedup");
+      const state = object.inventory.versions.v2.state;
+      const keepDigest = Object.entries(state).find(([, paths]) =>
+        paths.includes("keep.txt")
+      )![0];
+      assertEquals(object.inventory.manifest[keepDigest], [
+        "v1/content/keep.txt",
+      ]);
+      // No v2 copy of the unchanged file exists on storage.
+      assertEquals(
+        await root.backend.exists(
+          `${object.relativePath}/v2/content/keep.txt`,
+        ),
+        false,
+      );
+      assertEquals((await validateStorageRoot(root.backend)).valid, true);
+    });
+  });
+
+  Deno.test(`[${kind}] allowDeletes performs a logical deletion`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
+      await commit(root, { id: "urn:bk:del", sourcePath: source, user: USER });
+
+      await writeTree(source, { "a.txt": "one\n" });
+      await assertRejects(
+        async () =>
+          commit(await reopen(root), {
+            id: "urn:bk:del",
+            sourcePath: source,
+            user: USER,
+          }),
+        Error,
+        "allowDeletes",
+      );
+
+      const result = await commit(await reopen(root), {
+        id: "urn:bk:del",
+        sourcePath: source,
+        user: USER,
+        allowDeletes: true,
+      });
+      assertEquals(result.deletedPaths, ["b.txt"]);
+
+      const object = await requireObject(await reopen(root), "urn:bk:del");
+      // Prior content remains recoverable.
+      assertEquals(
+        await readText(
+          root.backend,
+          `${object.relativePath}/v1/content/b.txt`,
+        ),
+        "two\n",
+      );
+      assertEquals((await validateStorageRoot(root.backend)).valid, true);
+    });
+  });
+
+  Deno.test(`[${kind}] a competing commit landing during before-finalize aborts cleanly`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      await writeTree(source, { "a.txt": "one\n" });
+      await commit(root, { id: "urn:bk:race", sourcePath: source, user: USER });
+
+      const reopened = await reopen(root);
+      await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
+      const conflict = await assertRejects(
+        () =>
+          commit(reopened, {
+            id: "urn:bk:race",
+            sourcePath: source,
+            user: USER,
+            onFinalizeStep: async (step) => {
+              if (step !== "before-finalize") return;
+              const other = `${source}-other`;
+              await writeTree(other, { "a.txt": "one\n", "c.txt": "three\n" });
+              await commit(await reopen(root), {
+                id: "urn:bk:race",
+                sourcePath: other,
+                user: USER,
+              });
+            },
+          }),
+        HeadConflictError,
+      );
+      assertEquals(conflict.expectedHead, "v1");
+
+      // The winner's v2 stands untouched and the root remains valid.
+      const after = await requireObject(await reopen(root), "urn:bk:race");
+      assertEquals(after.inventory.head, "v2");
+      const v2Paths = Object.values(after.inventory.versions.v2.state).flat()
+        .sort();
+      assertEquals(v2Paths, ["a.txt", "c.txt"]);
+      assertEquals((await validateStorageRoot(root.backend)).valid, true);
+    });
+  });
+
+  Deno.test(`[${kind}] a crash after the version lands leaves the old head readable`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      await writeTree(source, { "a.txt": "one\n" });
+      await commit(root, { id: "urn:bk:crash", sourcePath: source, user: USER });
+
+      await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
+      await assertRejects(async () =>
+        commit(await reopen(root), {
+          id: "urn:bk:crash",
+          sourcePath: source,
+          user: USER,
+          onFinalizeStep: (step) => {
+            if (step === "after-version-move") {
+              throw new Error("simulated crash");
+            }
+          },
+        })
+      );
+
+      const object = await requireObject(await reopen(root), "urn:bk:crash");
+      assertEquals(object.inventory.head, "v1");
+      assertEquals(
+        await readText(
+          root.backend,
+          `${object.relativePath}/v1/content/a.txt`,
+        ),
+        "one\n",
+      );
+    });
+  });
+
+  Deno.test(`[${kind}] a crash between root inventory and sidecar is recoverable`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      await writeTree(source, { "a.txt": "one\n" });
+      await commit(root, {
+        id: "urn:bk:window",
+        sourcePath: source,
+        user: USER,
+      });
+
+      await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
+      await assertRejects(async () =>
+        commit(await reopen(root), {
+          id: "urn:bk:window",
+          sourcePath: source,
+          user: USER,
+          onFinalizeStep: (step) => {
+            if (step === "after-root-inventory") {
+              throw new Error("simulated crash");
+            }
+          },
+        })
+      );
+
+      const objectKey = root.layout!.resolve("urn:bk:window");
+      const result = await validateObject(root.backend, objectKey);
+      assertEquals(result.valid, false);
+      assertEquals(result.errors.map((issue) => issue.code), ["E060"]);
+      assertEquals(result.recoverable, true);
+    });
+  });
+
+  Deno.test(`[${kind}] commit refuses when an intermediate directory holds a file (E084)`, async () => {
+    await withBackendRoot(kind, async (root, source) => {
+      const relative = root.layout!.resolve("urn:bk:hier");
+      await root.backend.write(
+        `${relative.split("/")[0]}/stray.txt`,
+        new TextEncoder().encode("stray\n"),
+      );
+      await writeTree(source, { "a.txt": "one\n" });
+      await assertRejects(
+        () =>
+          commit(root, { id: "urn:bk:hier", sourcePath: source, user: USER }),
+        Error,
+        "intermediate directories",
+      );
+    });
+  });
+}
+
+Deno.test("[memory] stagingDir is rejected for object-store roots", async () => {
+  await withBackendRoot("memory", async (root, source) => {
+    await writeTree(source, { "a.txt": "one\n" });
+    await assertRejects(
+      () =>
+        commit(root, {
+          id: "urn:bk:staging",
+          sourcePath: source,
+          user: USER,
+          stagingDir: "/tmp/somewhere",
+        }),
+      Error,
+      "stagingDir applies only to local storage roots",
+    );
+  });
+});
+
+Deno.test("[memory] a concurrent ingest loses the object-root claim", async () => {
+  await withBackendRoot("memory", async (root, source) => {
+    await writeTree(source, { "a.txt": "mine\n" });
+    const conflict = await assertRejects(
+      () =>
+        commit(root, {
+          id: "urn:bk:claim",
+          sourcePath: source,
+          user: USER,
+          onFinalizeStep: async (step) => {
+            if (step !== "before-finalize") return;
+            // A competing writer ingests the same id first.
+            const other = `${source}-other`;
+            await writeTree(other, { "a.txt": "theirs\n" });
+            await commit(await reopen(root), {
+              id: "urn:bk:claim",
+              sourcePath: other,
+              user: USER,
+            });
+          },
+        }),
+      HeadConflictError,
+    );
+    assertEquals(conflict.actualHead, "<created>");
+
+    // The winner's object is intact and valid.
+    const object = await requireObject(await reopen(root), "urn:bk:claim");
+    assertEquals(
+      await readText(root.backend, `${object.relativePath}/v1/content/a.txt`),
+      "theirs\n",
+    );
+    assertEquals((await validateStorageRoot(root.backend)).valid, true);
+  });
+});
+
+Deno.test("[memory] a failed ingest rolls back its claimed prefix", async () => {
+  await withBackendRoot("memory", async (root, source) => {
+    const backend = root.backend as MemoryBackend;
+    await writeTree(source, { "a.txt": "one\n" });
+
+    backend.failNextWrite((key) => key.endsWith("/v1/inventory.json"));
+    await assertRejects(
+      () =>
+        commit(root, { id: "urn:bk:rollback", sourcePath: source, user: USER }),
+      Error,
+      "simulated write failure",
+    );
+
+    // The partial object was removed; the same id ingests cleanly afterwards.
+    const objectKey = root.layout!.resolve("urn:bk:rollback");
+    assertEquals(await backend.prefixExists(objectKey), false);
+    await commit(await reopen(root), {
+      id: "urn:bk:rollback",
+      sourcePath: source,
+      user: USER,
+    });
+    assertEquals((await validateStorageRoot(backend)).valid, true);
+  });
+});
+
+Deno.test("[memory] a root inventory that moves between re-verify and replace aborts without rollback", async () => {
+  await withBackendRoot("memory", async (root, source) => {
+    const backend = root.backend as MemoryBackend;
+    await writeTree(source, { "a.txt": "one\n" });
+    await commit(root, { id: "urn:bk:etag", sourcePath: source, user: USER });
+
+    const objectKey = root.layout!.resolve("urn:bk:etag");
+    const reopened = await reopen(root);
+    await writeTree(source, { "a.txt": "one\n", "b.txt": "two\n" });
+
+    // Mutate the stored root inventory inside the conditional replace, after
+    // re-verify captured its etag: the if-match condition must fail.
+    let intercepted = false;
+    backend.onWrite = (key) => {
+      if (intercepted || key !== `${objectKey}/inventory.json`) return;
+      const stored = backend.objects.get(key);
+      if (stored === undefined || !intercepted) {
+        // Only intercept the *conditional* replace (the version inventory
+        // write at `${objectKey}/v2/inventory.json` has a different key).
+        intercepted = true;
+        backend.objects.set(key, {
+          data: stored?.data.slice() ?? new Uint8Array(),
+          etag: "moved-by-competitor",
+        });
+      }
+    };
+
+    await assertRejects(
+      () =>
+        commit(reopened, { id: "urn:bk:etag", sourcePath: source, user: USER }),
+      HeadConflictError,
+    );
+    backend.onWrite = undefined;
+
+    // No rollback happened: the v2 prefix a competitor might own is intact.
+    assertEquals(await backend.prefixExists(`${objectKey}/v2`), true);
+    // The object itself still reads at v1.
+    const object = await requireObject(await reopen(root), "urn:bk:etag");
+    assertEquals(object.inventory.head, "v1");
   });
 });
