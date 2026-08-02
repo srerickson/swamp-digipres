@@ -275,7 +275,7 @@ const ValidateArgsSchema = z.object({
 /** Model definition for an OCFL storage root. */
 export const model = {
   type: "@crudec/ocfl-repository",
-  version: "2026.08.01.1",
+  version: "2026.08.02.1",
   description:
     "Read, validate, and version objects in an OCFL 1.1 storage root on a local filesystem or an S3-compatible object store",
   globalArguments: GlobalArgsSchema,

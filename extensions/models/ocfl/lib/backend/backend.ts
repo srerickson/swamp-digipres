@@ -83,7 +83,13 @@ export interface StorageBackend {
     conditions?: WriteConditions,
   ): Promise<void>;
 
-  /** Upload a local file to a key, creating any parent directories. */
+  /**
+   * Upload a local file to a key, creating any parent directories.
+   *
+   * Sources of any size are accepted: backends that cannot send a large file
+   * in one request (S3) split it into parts internally, so callers never need
+   * to chunk content themselves.
+   */
   writeFromFile(key: string, sourcePath: string): Promise<void>;
 
   /**
