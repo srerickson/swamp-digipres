@@ -1,26 +1,31 @@
 ---
 name: ocfl
-description: Guide for automating operations on existing OCFL (Oxford Common File Layout) repositories — ingesting, updating, validating, and deleting objects. Use when reading or writing OCFL storage roots, object roots, inventories, version directories, or when implementing/reviewing code that manipulates OCFL structures.
+description: Guide for automating operations on existing OCFL (Oxford Common File Layout) v1.0 and v1.1 repositories — ingesting, updating, validating, and deleting objects. Use when reading or writing OCFL storage roots, object roots, inventories, version directories, or when implementing/reviewing code that manipulates OCFL structures.
 ---
 
 # OCFL Automation Guide
 
-OCFL (v1.1) defines an application-independent, filesystem-based layout for
+OCFL v1.0 and v1.1 define an application-independent, filesystem-based layout for
 versioned digital objects: each object is a directory of immutable version
 directories plus a JSON inventory that maps content-addressed files (digests)
 to logical paths. A repository must be rebuildable from the storage root alone.
+Determine the governing version from the storage-root and object namaste files
+before applying a requirement.
 
 ## Authoritative references
 
 | Resource | Use it for |
 |----------|-----------|
-| `references/ocfl-spec-1.1.md` | Full normative spec. Key sections: §3.3 version directories, §3.5 inventory, §3.6–3.7 inventory digests, §4 storage root |
-| <https://ocfl.io/1.1/spec/validation-codes.html> | Meaning of `E###` (error) / `W###` (warning) codes embedded in the spec text |
+| `references/ocfl-spec-1.1.md` | Full normative v1.1 spec. Key sections: §3.3 version directories, §3.5 inventory, §3.6–3.7 inventory digests, §4 storage root |
+| `references/ocfl-spec-1.0.html` | Full published normative v1.0 specification (unaltered HTML) |
+| <https://ocfl.io/1.1/spec/validation-codes.html> | Meaning of v1.1 `E###` (error) / `W###` (warning) codes embedded in the spec text |
+| <https://ocfl.io/1.0/spec/> | Canonical published v1.0 specification and validation-code meanings |
 | <https://ocfl.github.io/extensions/> | Registered extensions, incl. storage layouts (`0002-flat-direct`, `0003-hash-and-id-n-tuple`, `0004-hashed-n-tuple`) |
 | <https://ocfl.io/1.1/implementation-notes/> | Non-normative guidance (client behaviors, versioning strategy, storage) |
 
-When in doubt about a MUST/SHOULD, grep the spec file — every requirement
-carries its validation code inline (`<span id="E064" ...>`).
+When in doubt about a MUST/SHOULD, inspect the spec matching the object's
+version. Both bundled sources carry validation codes inline as HTML spans
+(for example, `<span id="E064" ...>`).
 
 ## Anatomy
 
