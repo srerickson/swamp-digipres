@@ -18,6 +18,7 @@ before applying a requirement.
 |----------|-----------|
 | `references/ocfl-spec-1.1.md` | Full normative v1.1 spec. Key sections: §3.3 version directories, §3.5 inventory, §3.6–3.7 inventory digests, §4 storage root |
 | `references/ocfl-spec-1.0.html` | Full published normative v1.0 specification (unaltered HTML) |
+| `references/transactions.md` | Modeling a create/update as an interruptible, resumable, revertible transaction (POSIX + S3) |
 | <https://ocfl.io/1.1/spec/validation-codes.html> | Meaning of v1.1 `E###` (error) / `W###` (warning) codes embedded in the spec text |
 | <https://ocfl.io/1.0/spec/> | Canonical published v1.0 specification and validation-code meanings |
 | <https://ocfl.github.io/extensions/> | Registered extensions, incl. storage layouts (`0002-flat-direct`, `0003-hash-and-id-n-tuple`, `0004-hashed-n-tuple`) |
@@ -118,6 +119,15 @@ for `0=ocfl_object_*` namaste files. After resolving, confirm
 7. OCFL has no locking. Serialize writers externally and re-verify `head`
    hasn't moved immediately before step 6.
 
+For anything that must survive interruption — resumable ingest, crash recovery,
+rollback, concurrent writers — follow `references/transactions.md`. In brief:
+serialize the new inventory once and cache the bytes before any storage write;
+write directly to final paths (same code path for POSIX and S3); always write
+`vN+1/inventory.json` + sidecar before touching the root, so an interrupted
+commit is self-describing; treat the **root sidecar** as the sole commit point;
+record phase durably in a log outside the storage root, ahead of the action it
+authorizes.
+
 An object created under OCFL 1.0 may stay 1.0 or be upgraded (new namaste
 file + `type` value) — a version must conform to the same or later spec
 version than its predecessor (E103), and never later than the storage root's.
@@ -147,6 +157,9 @@ Two distinct operations — always confirm which one is intended, and run
 - **Logical deletion (the OCFL-native way):** create a new version whose
   `state` omits the paths. Content remains in prior versions and stays
   recoverable; the manifest keeps its entries. This is a normal update.
+- **Abort (uncommitted):** if a create/update is still in flight, remove the
+  target version directory and restore the root inventory — see
+  `references/transactions.md` §9.1. Distinct from both cases below.
 - **Purge (destructive, outside the spec):** removing content from history
   or deleting a whole object means removing the object root (plus any
   now-empty parent directories, since empty dirs are forbidden) or rebuilding
@@ -167,3 +180,14 @@ Two distinct operations — always confirm which one is intended, and run
 - [ ] Adding files under a prior version directory "for efficiency".
 - [ ] Deleting an object without removing now-empty hierarchy directories.
 - [ ] Skipping the id-in-inventory check before destructive operations.
+- [ ] Assuming a version directory contains an `inventory.json` — it is a
+      SHOULD (W010), not a MUST, so head cannot be recovered by scanning for
+      the highest version with a valid inventory.
+- [ ] Writing an inventory or sidecar in place instead of temp-then-rename
+      (POSIX) — a torn write to the root inventory loses the object.
+- [ ] Leaving anything between the root `inventory.json` and its sidecar write:
+      in that window the object fails validation outright (E060).
+- [ ] Re-serializing the inventory on a resumed operation instead of replaying
+      cached bytes (drift breaks the sidecar and E064).
+- [ ] Trusting size+mtime alone that a staged source file hasn't changed since
+      its digest was recorded.
