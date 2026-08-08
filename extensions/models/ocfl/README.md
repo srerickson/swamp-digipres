@@ -3,15 +3,14 @@
 A swamp model type for an [OCFL](https://ocfl.io) storage root, backed by either
 a local filesystem or an S3-compatible object store.
 
-This iteration covers the **read path plus storage root initialization**:
-
 - `init` — create a conformant OCFL 1.1 storage root, including its storage
   layout extension config
 - `list` — index every object in the root, writing one resource per object
 - `get` — resolve one object's logical paths to the content files holding them
+- `create_version` — create a new version of an object, creating the object
+  itself when it does not exist yet
 
-Writing objects (ingest, new versions), validation, and content download are
-deliberately **not** implemented yet.
+Validation and content download are deliberately **not** implemented yet.
 
 ## Storage backends
 
@@ -27,6 +26,12 @@ the OCFL logic serve both backends.
 S3 has no directories — a "directory" is just a set of keys sharing a prefix.
 Code above the storage layer never assumes a directory exists as an entity, so
 empty-directory rules (E073) are not enforced on either backend.
+
+`aws4fetch` rather than `@aws-sdk/client-s3` is a deliberate trade: swamp
+inlines npm packages into the extension bundle, and aws4fetch is a few kilobytes
+with no dependencies where the SDK is megabytes. Multipart upload is therefore
+hand-rolled against the S3 REST API (`lib/storage/s3.ts`), which is roughly 150
+lines — see [Large files](#large-files).
 
 ## Configuration
 
@@ -105,12 +110,106 @@ directly; otherwise every object root is scanned. Either way the inventory's own
 `id` is checked against the requested one — the path is never taken as proof of
 identity.
 
+### `create_version`
+
+Creating an object and updating one are the same operation in OCFL: both mean
+committing a new version. The caller does not supply a file listing — it
+supplies edits against the previous version's logical state, applied in order.
+
+```bash
+swamp model method run my-repo create_version \
+  --input id=urn:example:object-1 \
+  --input version=1 \
+  --input 'ops:json=["add:/ingest/spec.md:docs/spec.md"]' \
+  --input userName="Seth Erickson" \
+  --input userAddress=mailto:seth@crude.computer \
+  --input message="initial deposit"
+```
+
+| Operation                    | Effect                                                      |
+| ---------------------------- | ----------------------------------------------------------- |
+| `add:<source>:<logicalPath>` | Copy a local file in at that logical path, superseding any  |
+| `remove:<logicalPath>`       | Drop the path from the new state; content stays recoverable |
+| `rename:<from>:<to>`         | Move a logical path; writes no content at all               |
+
+Sources are absolute local paths. Escape a literal colon as `\:`.
+
+`--input key=value` does not accumulate repeated keys, so a list of operations
+arrives one of three ways — all parse identically:
+
+```bash
+--input 'ops:json=["add:/a.txt:a.txt","remove:b.txt"]'   # JSON array
+--input ops=$'add:/a.txt:a.txt\nremove:b.txt'            # newline-delimited
+--input-file ingest.yaml                                  # YAML list under `ops:`
+```
+
+**`version` is an assertion, not an instruction.** It is the unpadded number the
+call expects to produce — `1` for a new object, `head+1` otherwise — checked
+before anything is written, and the object's own zero-padding convention is
+applied when naming the directory (E011–E013). Omit it to take `head+1`; supply
+it to catch a stale caller, a concurrent writer, or a typo'd id that would
+otherwise silently deposit a brand-new object.
+
+`userName` and `userAddress` are required. W007 wants both, and a version
+committed without an agent is a provenance defect that cannot be corrected
+afterwards. `message` is optional.
+
+New objects default to `sha512` and a `content` content directory, both
+overridable; for an existing object these are fixed properties and a conflicting
+argument is rejected rather than ignored. A version whose state matches its
+predecessor's is refused unless `allowNoChange=true`. `dryRun=true` reports the
+full plan — content files to write, bytes to transfer — and writes nothing.
+
+#### What it guarantees
+
+Deduplication is automatic: only digests absent from the manifest get content
+files, so an unchanged file in a new version resolves back to its original
+version's content path, and a `rename` transfers no bytes.
+
+The write order follows `references/transactions.md` §8 and is not negotiable:
+conformance declaration first for a new object, then content, then
+`vN/inventory.json` and its sidecar, then the root inventory and — as the single
+commit point — the root sidecar, with nothing between those last two. Sources
+are digested at plan time and re-verified as they are written, so a source that
+changed in between is a fatal error rather than a silent substitution. The root
+inventory is re-read immediately before the commit and compared against the
+digest seen at plan time; OCFL has no locking, so this is what stands between a
+concurrent writer and a lost version.
+
+A failure anywhere before the commit point rolls back, removing only paths under
+the target version directory — and the object root itself only when this call
+verified it was empty and claimed it. Content bytes are written directly to
+their final paths rather than staged and moved, so an interrupted run leaves a
+version directory a third-party validator would flag (E046) until rollback
+completes. There is **no durable transaction log**: a crashed process does not
+resume, and recovery is manual per `references/transactions.md` §11.
+
+## Large files
+
+Content is streamed, never buffered whole. On S3 a source larger than the part
+size (16 MiB by default) becomes a multipart upload: `CreateMultipartUpload`,
+`UploadPart` per part with bounded concurrency, then `CompleteMultipartUpload`,
+with `AbortMultipartUpload` on any failure so orphaned parts do not accrue
+storage charges.
+
+Two constraints drive the implementation. Every part but the last is exactly the
+same size, because Cloudflare R2 rejects uneven non-final parts where AWS
+tolerates them. And when the source size is known, the part size scales up so
+the upload stays within the 10,000-part API ceiling.
+
+S3 deployments should still set a lifecycle rule to abort incomplete multipart
+uploads: this code aborts its own failures, but a killed process cannot.
+
 ## Resources
 
 | Spec     | Instance name                     | Contents                                              |
 | -------- | --------------------------------- | ----------------------------------------------------- |
 | `root`   | `root`                            | Backend, location, spec version, layout, object count |
 | `object` | `object-<sanitized-id>-<digest8>` | Versions, and the resolved state at one version       |
+
+`create_version` writes the same `object` resource as `get`, re-read from
+storage after the commit rather than reported from the plan — so the resource
+reflects an object that actually parses and verifies against its sidecar.
 
 Instance names become storage paths, so ids are sanitized. Sanitization is
 lossy, so a digest suffix keeps the mapping injective.
@@ -131,6 +230,23 @@ does not depend on the backend. `testdata/fixtures/ocfl-root` is real
 `ocfl-tools` output and is never mutated; tests that write use
 `Deno.makeTempDir()`.
 
+`commit_test.ts` asserts through the _read_ path: every write is verified by
+re-opening the object with `openObjectAt` / `readInventory` / `resolveState`
+rather than by inspecting what the writer believed it did. Since `readInventory`
+checks each inventory against its sidecar (E058–E061), a successful read-back is
+itself the assertion that the commit produced a coherent object.
+
+`lib/storage/multipart_test.ts` stubs the global `fetch` that `aws4fetch` calls,
+so the multipart protocol is asserted request by request without a live bucket.
+
 The `MECHANICAL:` tests in `mod_test.ts` enforce the adversarial review gate's
 schema-write conformance checks. Swamp only _warns_ when written data does not
 match a resource schema, so those assertions are what actually catch drift.
+
+No OCFL validator is bundled. To check output against a third-party
+implementation:
+
+```bash
+go install github.com/srerickson/ocfl-tools/cmd/ocfl@latest
+ocfl validate --root /path/to/storage-root
+```

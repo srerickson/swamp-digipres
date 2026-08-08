@@ -80,6 +80,36 @@ export class MemoryStorage implements Storage {
     this.#files.set(normalize(path), bytes.slice());
     return Promise.resolve();
   }
+
+  /** A map insert is already indivisible to any reader here. */
+  writeAtomic(path: string, bytes: Bytes): Promise<void> {
+    return this.write(path, bytes);
+  }
+
+  async writeStream(
+    path: string,
+    body: ReadableStream<Uint8Array>,
+    _options?: { size?: number },
+  ): Promise<void> {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of body) {
+      chunks.push(chunk);
+      size += chunk.byteLength;
+    }
+    const bytes = new Uint8Array(new ArrayBuffer(size));
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    this.#files.set(normalize(path), bytes);
+  }
+
+  remove(path: string): Promise<void> {
+    this.#files.delete(normalize(path));
+    return Promise.resolve();
+  }
 }
 
 /** Collapse a storage path to its canonical `a/b/c` form. */

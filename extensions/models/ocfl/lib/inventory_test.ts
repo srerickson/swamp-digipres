@@ -3,10 +3,13 @@ import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import {
   contentDirectoryOf,
+  formatVersionName,
+  nextVersion,
   parseInventory,
   parseSidecar,
   readInventory,
   versionNames,
+  versionPadding,
 } from "./inventory.ts";
 import { MemoryStorage } from "./storage/memory.ts";
 
@@ -180,4 +183,80 @@ Deno.test("versionNames handles a zero-padded convention", () => {
     "inventory.json",
   );
   assertEquals(versionNames(inventory), ["v0001", "v0002", "v0010"]);
+});
+
+/** Build an inventory whose versions are exactly `names`, head last. */
+function withVersions(names: string[]) {
+  return parseInventory(
+    new TextEncoder().encode(JSON.stringify({
+      ...MINIMAL,
+      head: names[names.length - 1],
+      versions: Object.fromEntries(
+        names.map((name) => [name, {
+          created: "2026-08-08T12:00:00Z",
+          state: {},
+        }]),
+      ),
+    })),
+    "inventory.json",
+  );
+}
+
+Deno.test("versionPadding reads the object's own convention", () => {
+  assertEquals(versionPadding(withVersions(["v1", "v2"])), 0);
+  assertEquals(versionPadding(withVersions(["v0001", "v0002"])), 4);
+  assertEquals(versionPadding(withVersions(["v001"])), 3);
+});
+
+Deno.test("formatVersionName applies a padding width", () => {
+  assertEquals(formatVersionName(3, 0), "v3");
+  assertEquals(formatVersionName(3, 4), "v0003");
+  assertEquals(formatVersionName(1234, 4), "v1234");
+});
+
+Deno.test("nextVersion extends the existing convention", () => {
+  assertEquals(nextVersion(withVersions(["v1", "v2"])), {
+    name: "v3",
+    number: 3,
+  });
+  // Padding is fixed by v1 and must be carried forward, not re-decided.
+  assertEquals(nextVersion(withVersions(["v0001", "v0002"])), {
+    name: "v0003",
+    number: 3,
+  });
+  // The 9 → 10 rollover keeps the width rather than growing it.
+  const nine = Array.from({ length: 9 }, (_, i) => formatVersionName(i + 1, 4));
+  assertEquals(nextVersion(withVersions(nine)), { name: "v0010", number: 10 });
+});
+
+Deno.test("nextVersion rejects a gap in the version sequence", () => {
+  const error = assertThrows(
+    () => nextVersion(withVersions(["v1", "v3"])),
+    OcflError,
+  );
+  assertEquals(error.code, "E011");
+  assertThrows(() => nextVersion(withVersions(["v1", "v0002"])), OcflError);
+});
+
+Deno.test("nextVersion rejects a head that disagrees with the versions", () => {
+  const inventory = withVersions(["v1", "v2"]);
+  const wrongHead = { ...inventory, head: "v1" };
+  const error = assertThrows(() => nextVersion(wrongHead), OcflError);
+  assertEquals(error.code, "E040");
+});
+
+Deno.test("nextVersion refuses to overflow a padded convention", () => {
+  // v9999 -> v10000 would silently widen the names, breaking E011.
+  const inventory = withVersions(["v9999"]);
+  const padded = {
+    ...inventory,
+    versions: Object.fromEntries(
+      Array.from({ length: 9999 }, (_, index) => [
+        formatVersionName(index + 1, 4),
+        { created: "2026-08-08T12:00:00Z", state: {} },
+      ]),
+    ),
+  };
+  const error = assertThrows(() => nextVersion(padded), OcflError);
+  assertEquals(error.code, "E011");
 });

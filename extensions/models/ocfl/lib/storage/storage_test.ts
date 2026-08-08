@@ -10,6 +10,7 @@ import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { isNotFound } from "../errors.ts";
 import { LocalStorage } from "./local.ts";
 import { MemoryStorage } from "./memory.ts";
+import { removeTree } from "./tree.ts";
 import type { Storage } from "./types.ts";
 import { joinPath } from "./types.ts";
 
@@ -120,6 +121,131 @@ forEachBackend("walkFiles yields every nested file", async (storage) => {
 forEachBackend("paths are normalized, not doubled", async (storage) => {
   await storage.write("/a//b.txt", encoder.encode("v"));
   assertEquals(decoder.decode(await storage.read("a/b.txt")), "v");
+});
+
+forEachBackend("writeAtomic round-trips and overwrites", async (storage) => {
+  await storage.writeAtomic("obj/inventory.json", encoder.encode("first"));
+  assertEquals(
+    decoder.decode(await storage.read("obj/inventory.json")),
+    "first",
+  );
+  await storage.writeAtomic("obj/inventory.json", encoder.encode("second"));
+  assertEquals(
+    decoder.decode(await storage.read("obj/inventory.json")),
+    "second",
+  );
+});
+
+forEachBackend("writeAtomic leaves no scratch file behind", async (storage) => {
+  await storage.writeAtomic("obj/v1/inventory.json", encoder.encode("{}"));
+  const found: string[] = [];
+  for await (const path of storage.walkFiles("")) found.push(path);
+  assertEquals(found, ["obj/v1/inventory.json"]);
+});
+
+forEachBackend("writeStream round-trips a chunked source", async (storage) => {
+  const chunks = ["alpha", "-", "bravo", "-", "charlie"];
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+  await storage.writeStream("v1/content/a.txt", stream, { size: 21 });
+  assertEquals(
+    decoder.decode(await storage.read("v1/content/a.txt")),
+    chunks.join(""),
+  );
+});
+
+forEachBackend(
+  "writeStream creates intermediate directories",
+  async (storage) => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("x"));
+        controller.close();
+      },
+    });
+    await storage.writeStream("deep/nest/ed/file.txt", stream);
+    assertEquals(await storage.exists("deep/nest/ed/file.txt"), true);
+  },
+);
+
+forEachBackend("writeStream handles an empty source", async (storage) => {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.close();
+    },
+  });
+  await storage.writeStream("empty.txt", stream, { size: 0 });
+  assertEquals((await storage.read("empty.txt")).byteLength, 0);
+});
+
+forEachBackend("remove deletes a file", async (storage) => {
+  await storage.write("a/b.txt", encoder.encode("x"));
+  await storage.remove("a/b.txt");
+  assertEquals(await storage.exists("a/b.txt"), false);
+});
+
+forEachBackend("remove of an absent path is not an error", async (storage) => {
+  await storage.remove("never/existed.txt");
+});
+
+forEachBackend(
+  "removeTree deletes everything beneath a prefix",
+  async (storage) => {
+    await storage.write("obj/v1/content/a.txt", encoder.encode("a"));
+    await storage.write("obj/v1/content/deep/b.txt", encoder.encode("b"));
+    await storage.write("obj/v1/inventory.json", encoder.encode("{}"));
+    await storage.write("obj/inventory.json", encoder.encode("{}"));
+
+    const removed = await removeTree(storage, "obj/v1");
+    assertEquals(removed.length, 3);
+
+    const left: string[] = [];
+    for await (const path of storage.walkFiles("")) left.push(path);
+    // Only the target subtree goes; a sibling at the same level survives.
+    assertEquals(left, ["obj/inventory.json"]);
+  },
+);
+
+forEachBackend("removeTree refuses an empty prefix", async (storage) => {
+  await storage.write("a.txt", encoder.encode("x"));
+  await assertRejects(() => removeTree(storage, ""), Error, "non-empty prefix");
+  assertEquals(await storage.exists("a.txt"), true);
+});
+
+Deno.test("pruneEmptyDirs removes the skeleton a removed subtree left", async () => {
+  // Only meaningful on a real filesystem: an empty directory under a storage
+  // root is an E073 violation, where an S3 prefix simply ceases to exist.
+  const dir = await Deno.makeTempDir({ prefix: "ocfl-prune-" });
+  try {
+    const storage = new LocalStorage(dir);
+    await storage.write(
+      "5b8/259/53a/obj/v1/content/a.txt",
+      encoder.encode("a"),
+    );
+    await removeTree(storage, "5b8/259/53a/obj");
+    for (let depth = 3; depth > 0; depth -= 1) {
+      await storage.pruneEmptyDirs?.(
+        ["5b8", "259", "53a"].slice(0, depth).join("/"),
+      );
+    }
+    assertEquals(await Array.fromAsync(Deno.readDir(dir)), []);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("pruneEmptyDirs never removes the storage root", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "ocfl-prune-root-" });
+  try {
+    await new LocalStorage(dir).pruneEmptyDirs?.("");
+    assertEquals((await Deno.stat(dir)).isDirectory, true);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test("joinPath drops empty segments", () => {

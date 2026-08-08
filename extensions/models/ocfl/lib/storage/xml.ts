@@ -53,7 +53,12 @@ function collectRaw(xml: string, tag: string): string[] {
   return [...xml.matchAll(pattern)].map((match) => match[1]);
 }
 
-/** Decoded text of the first `<tag>` element, or `undefined` if absent. */
+/**
+ * Decoded text of the first `<tag>` element, or `undefined` if absent.
+ *
+ * Exported as {@linkcode firstTag} for the multipart responses, which carry a
+ * single interesting field each.
+ */
 function first(xml: string, tag: string): string | undefined {
   const pattern = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`);
   const match = xml.match(pattern);
@@ -90,4 +95,38 @@ export function parseListObjectsV2(xml: string): ListObjectsResult {
     : undefined;
 
   return { keys, commonPrefixes, nextContinuationToken };
+}
+
+/** Decoded text of the first `<tag>` element, or `undefined` if absent. */
+export function firstTag(xml: string, tag: string): string | undefined {
+  return first(xml, tag);
+}
+
+/** Escape text for inclusion in an XML element body. */
+function escapeXml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Build a `CompleteMultipartUpload` request body.
+ *
+ * Parts must be listed in ascending part-number order; S3 rejects the request
+ * otherwise, so they are sorted here rather than trusted from the caller.
+ */
+export function completeMultipartUploadBody(
+  parts: Array<{ partNumber: number; etag: string }>,
+): string {
+  const elements = [...parts]
+    .sort((a, b) => a.partNumber - b.partNumber)
+    .map((part) =>
+      `<Part><PartNumber>${part.partNumber}</PartNumber>` +
+      `<ETag>${escapeXml(part.etag)}</ETag></Part>`
+    )
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
+    `${elements}</CompleteMultipartUpload>`;
 }

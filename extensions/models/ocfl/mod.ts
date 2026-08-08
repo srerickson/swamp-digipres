@@ -1,11 +1,11 @@
 /**
  * Swamp model type for an OCFL storage root, on local disk or in S3.
  *
- * This iteration covers the read path plus storage root initialization:
  * `init` creates a conformant root with a layout extension, `list` indexes
- * every object in it, and `get` resolves one object's logical paths to the
- * content files that hold them. Nothing here writes an OCFL object — ingest,
- * new versions, and validation are deliberately out of scope.
+ * every object in it, `get` resolves one object's logical paths to the content
+ * files that hold them, and `create_version` deposits a new version — creating
+ * the object too when it does not exist yet, since in OCFL those are the same
+ * operation. Validation and content download remain out of scope.
  *
  * Methods are thin: they parse arguments, call into `lib/`, and map the result
  * onto resources. All OCFL knowledge lives in `lib/`, and everything there
@@ -15,9 +15,11 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import { commitVersion, planVersion, type VersionPlan } from "./lib/commit.ts";
 import { createStorage } from "./lib/config.ts";
 import { digestText } from "./lib/digest.ts";
 import { contentDirectoryOf, versionNames } from "./lib/inventory.ts";
+import { parseOps } from "./lib/ops.ts";
 import {
   FLAT_DIRECT,
   HASHED_N_TUPLE,
@@ -27,6 +29,7 @@ import {
   findObject,
   listObjects,
   type OcflObject,
+  openObjectAt,
   resolveState,
   versionFileCount,
 } from "./lib/object.ts";
@@ -230,6 +233,48 @@ const GetArgsSchema = z.object({
   ),
 });
 
+const CreateVersionArgsSchema = z.object({
+  id: z.string().min(1).describe(
+    "Object id. Created if it does not exist yet, otherwise extended.",
+  ),
+  ops: z.union([z.array(z.string()), z.string()]).describe(
+    "Operations building the new version's state, applied in order: " +
+      "'add:<source>:<logicalPath>', 'remove:<logicalPath>', " +
+      "'rename:<from>:<to>'. Sources are absolute local paths. Escape a " +
+      "literal colon as '\\:'. Pass as ops:json=[...], a YAML list via " +
+      "--input-file, or one newline-delimited string.",
+  ),
+  version: z.number().int().positive().optional().describe(
+    "Version number this call expects to create, unpadded (1 for a new " +
+      "object). Asserted against the object's actual head before anything is " +
+      "written; omit to take head+1.",
+  ),
+  message: z.string().optional().describe(
+    "Message recorded in the new version block",
+  ),
+  userName: z.string().min(1).describe(
+    "Name of the agent recorded against the new version",
+  ),
+  userAddress: z.string().min(1).describe(
+    "Address of that agent, ideally a mailto: or ORCID URI",
+  ),
+  digestAlgorithm: z.enum(["sha512", "sha256"]).optional().describe(
+    "New objects only: inventory digest algorithm. Defaults to sha512; an " +
+      "existing object's algorithm is fixed and cannot be changed.",
+  ),
+  contentDirectory: z.string().optional().describe(
+    "New objects only: content directory name. Defaults to 'content'; it is " +
+      "fixed at v1 and never changes.",
+  ),
+  allowNoChange: z.boolean().default(false).describe(
+    "Permit a version whose state is identical to its predecessor's. Legal " +
+      "OCFL, but almost always a mistake, so it is refused by default.",
+  ),
+  dryRun: z.boolean().default(false).describe(
+    "Plan the version and report it without writing anything",
+  ),
+});
+
 /** Model definition for an OCFL storage root. */
 export const model = {
   type: "@crudec/ocfl-repository",
@@ -420,5 +465,87 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+
+    create_version: {
+      description:
+        "Create a new version of an OCFL object, creating the object itself when it does not exist yet",
+      arguments: CreateVersionArgsSchema,
+      execute: async (
+        args: z.infer<typeof CreateVersionArgsSchema>,
+        context: MethodContext,
+      ) => {
+        const storage = createStorage(context.globalArgs, context.signal);
+        const root = await openStorageRoot(storage);
+        const plan = await planVersion(root, {
+          id: args.id,
+          ops: parseOps(args.ops),
+          version: args.version,
+          message: args.message,
+          userName: args.userName,
+          userAddress: args.userAddress,
+          digestAlgorithm: args.digestAlgorithm,
+          contentDirectory: args.contentDirectory,
+          allowNoChange: args.allowNoChange,
+        });
+
+        context.logger.info(
+          "Planned {version} of {id} at {path}: {files} logical file(s), " +
+            "{writes} content file(s) to write, {deduped} deduplicated",
+          {
+            version: plan.version,
+            id: plan.id,
+            path: plan.objectPath,
+            files: plan.logicalPaths.length,
+            writes: plan.content.length,
+            deduped: plan.logicalPaths.length - plan.content.length,
+          },
+        );
+        for (const entry of plan.content) {
+          context.logger.info("  {source} -> {contentPath}", {
+            source: entry.source,
+            contentPath: entry.contentPath,
+          });
+        }
+
+        if (args.dryRun) {
+          context.logger.info(
+            "Dry run: nothing was written. {summary}",
+            { summary: planSummary(plan) },
+          );
+          return { dataHandles: [] };
+        }
+
+        await commitVersion(root, plan, { logger: context.logger });
+
+        // Re-open rather than trusting the plan: this verifies the conformance
+        // declaration, re-reads the inventory, and checks it against the
+        // sidecar that was just written.
+        const object = await openObjectAt(root, plan.objectPath);
+        context.logger.info(
+          "Committed {version} of {id} ({files} logical file(s)) at {path}",
+          {
+            version: plan.version,
+            id: plan.id,
+            files: plan.logicalPaths.length,
+            path: plan.objectPath,
+          },
+        );
+
+        const handle = await context.writeResource(
+          "object",
+          objectInstanceName(args.id),
+          objectSnapshot(object, plan.version),
+        );
+        return { dataHandles: [handle] };
+      },
+    },
   },
 };
+
+/** One-line description of a plan, for the dry-run log. */
+function planSummary(plan: VersionPlan): string {
+  const bytes = plan.content.reduce((total, entry) => total + entry.size, 0);
+  return `${plan.isNew ? "create" : "update"} ${plan.id} as ${plan.version} ` +
+    `(${plan.digestAlgorithm}, ${plan.content.length} content file(s), ` +
+    `${bytes} byte(s) to transfer)`;
+}

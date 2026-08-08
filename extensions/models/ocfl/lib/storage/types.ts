@@ -66,6 +66,41 @@ export interface Storage {
 
   /** Write a file, creating any intermediate directories. */
   write(path: string, bytes: Bytes): Promise<void>;
+
+  /**
+   * Write a file such that a reader never observes partial contents.
+   *
+   * Writing OCFL content directly to its final path (rather than staging it
+   * elsewhere and moving it in) makes per-file atomicity the client's job: a
+   * torn write to a root `inventory.json` destroys the object's head. Use this
+   * for every inventory and sidecar; `write` is fine for content, whose paths
+   * are digest-addressed and belong to one uncommitted version.
+   */
+  writeAtomic(path: string, bytes: Bytes): Promise<void>;
+
+  /**
+   * Stream a file in, without holding it in memory.
+   *
+   * @param size Source size when known. Backends use it to choose an upload
+   *   strategy; a missing size must still produce a correct write.
+   */
+  writeStream(
+    path: string,
+    body: ReadableStream<Uint8Array>,
+    options?: { size?: number },
+  ): Promise<void>;
+
+  /** Delete a file. Absent paths are not an error. */
+  remove(path: string): Promise<void>;
+
+  /**
+   * Remove directories left empty beneath `prefix`, and `prefix` itself.
+   *
+   * Only meaningful on a real filesystem, where an empty directory under the
+   * storage root violates E073. S3 prefixes are not entities, so the backend
+   * omits this and callers must treat it as optional.
+   */
+  pruneEmptyDirs?(prefix: string): Promise<void>;
 }
 
 /**

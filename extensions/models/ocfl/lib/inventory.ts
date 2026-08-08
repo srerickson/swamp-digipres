@@ -185,3 +185,69 @@ export function versionNumber(name: string): number {
   const match = name.match(/^v(\d+)$/);
   return match === null ? 0 : Number.parseInt(match[1], 10);
 }
+
+/**
+ * Zero-padding width the object's version names use.
+ *
+ * `v0001` yields 4 and `v1` yields 0. The convention is fixed by v1 and must
+ * never change within an object (E011–E013), so it is read from the object
+ * rather than configured.
+ */
+export function versionPadding(inventory: Inventory): number {
+  const first = versionNames(inventory)[0];
+  if (first === undefined) return 0;
+  const digits = first.slice(1);
+  return digits.startsWith("0") ? digits.length : 0;
+}
+
+/** Format a version number under a padding convention. */
+export function formatVersionName(number: number, padding: number): string {
+  return `v${String(number).padStart(padding, "0")}`;
+}
+
+/**
+ * The version that would follow `head`.
+ *
+ * Verifies the existing sequence is a contiguous `v1..head` under one naming
+ * convention before extending it: a gap or a stray name means the object is
+ * already invalid (E010–E013), and appending to it would bury the evidence.
+ *
+ * @throws {OcflError} when the version sequence is not well-formed.
+ */
+export function nextVersion(
+  inventory: Inventory,
+): { name: string; number: number } {
+  const names = versionNames(inventory);
+  const padding = versionPadding(inventory);
+
+  for (const [index, name] of names.entries()) {
+    const expected = formatVersionName(index + 1, padding);
+    if (name !== expected) {
+      throw new OcflError(
+        `object ${inventory.id} has a malformed version sequence: expected ` +
+          `${expected} but found ${name} (versions: ${names.join(", ")})`,
+        { code: "E011" },
+      );
+    }
+  }
+
+  const head = versionNumber(inventory.head);
+  if (head !== names.length) {
+    throw new OcflError(
+      `object ${inventory.id} declares head ${inventory.head} but has ` +
+        `${names.length} version(s): ${names.join(", ")}`,
+      { code: "E040" },
+    );
+  }
+
+  const number = head + 1;
+  const name = formatVersionName(number, padding);
+  if (padding > 0 && name.length !== names[0].length) {
+    throw new OcflError(
+      `object ${inventory.id} cannot be extended: ${number} does not fit the ` +
+        `zero-padded naming convention established by ${names[0]}`,
+      { code: "E011" },
+    );
+  }
+  return { name, number };
+}

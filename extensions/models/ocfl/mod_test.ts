@@ -5,7 +5,12 @@
  * Swamp only *warns* when written data does not match a resource schema, so
  * these assertions are what actually catch a schema/write drift.
  */
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1";
 import { z } from "npm:zod@4";
 import {
   model,
@@ -249,6 +254,209 @@ Deno.test("objectInstanceName is stable, safe, and injective", () => {
 
   // Ids that sanitize identically must still get distinct instance names.
   assert(objectInstanceName("a:b") !== objectInstanceName("a/b"));
+});
+
+/** A temp storage root plus a temp source directory, for the write tests. */
+async function writableRepo() {
+  const rootDir = await Deno.makeTempDir({ prefix: "ocfl-mod-write-" });
+  const sourceDir = await Deno.makeTempDir({ prefix: "ocfl-mod-src-" });
+  await model.methods.init.execute(
+    args(model.methods.init.arguments, {}),
+    fakeContext({ storage: "local", path: rootDir }).context,
+  );
+  return {
+    rootDir,
+    async source(name: string, contents: string) {
+      const path = `${sourceDir}/${name}`;
+      await Deno.writeTextFile(path, contents);
+      return path;
+    },
+    async cleanup() {
+      for (const dir of [rootDir, sourceDir]) {
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
+      }
+    },
+  };
+}
+
+const AGENT = {
+  userName: "Test Agent",
+  userAddress: "mailto:test@example.com",
+};
+
+Deno.test("create_version writes one object resource for a new object", async () => {
+  const repo = await writableRepo();
+  try {
+    const { context, writes } = fakeContext({
+      storage: "local",
+      path: repo.rootDir,
+    });
+    await model.methods.create_version.execute(
+      args(model.methods.create_version.arguments, {
+        id: "urn:example:new-1",
+        ops: [`add:${await repo.source("a.txt", "alpha")}:docs/a.txt`],
+        version: 1,
+        message: "initial deposit",
+        ...AGENT,
+      }),
+      context,
+    );
+
+    assertEquals(writes.length, 1);
+    assertEquals(writes[0].spec, "object");
+    assertEquals(writes[0].name, objectInstanceName("urn:example:new-1"));
+
+    const data = ObjectSchema.parse(writes[0].data);
+    assertEquals(data.id, "urn:example:new-1");
+    assertEquals(data.head, "v1");
+    assertEquals(data.version, "v1");
+    assertEquals(data.versionCount, 1);
+    assertEquals(data.digestAlgorithm, "sha512");
+    assertEquals(data.state.map((entry) => entry.logicalPath), ["docs/a.txt"]);
+    assertEquals(data.state[0].contentPaths, ["v1/content/docs/a.txt"]);
+    assertEquals(data.versions[0].message, "initial deposit");
+    assertEquals(data.versions[0].userName, AGENT.userName);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+Deno.test("MECHANICAL: create_version output matches ObjectSchema exactly", async () => {
+  const repo = await writableRepo();
+  try {
+    const { context, writes } = fakeContext({
+      storage: "local",
+      path: repo.rootDir,
+    });
+    await model.methods.create_version.execute(
+      args(model.methods.create_version.arguments, {
+        id: "urn:example:shape",
+        ops: [`add:${await repo.source("a.txt", "alpha")}:a.txt`],
+        ...AGENT,
+      }),
+      context,
+    );
+    assertEquals(
+      Object.keys(writes[0].data).sort(),
+      Object.keys(ObjectSchema.shape).sort(),
+      "snapshot fields and schema fields must correspond 1:1",
+    );
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+Deno.test("create_version updates an existing object and reports the new head", async () => {
+  const repo = await writableRepo();
+  try {
+    const { context, writes } = fakeContext({
+      storage: "local",
+      path: repo.rootDir,
+    });
+    const create = args(model.methods.create_version.arguments, {
+      id: "urn:example:obj-2",
+      ops: [`add:${await repo.source("a.txt", "alpha")}:a.txt`],
+      ...AGENT,
+    });
+    await model.methods.create_version.execute(create, context);
+
+    await model.methods.create_version.execute(
+      args(model.methods.create_version.arguments, {
+        id: "urn:example:obj-2",
+        ops: [`add:${await repo.source("b.txt", "bravo")}:b.txt`],
+        version: 2,
+        ...AGENT,
+      }),
+      context,
+    );
+
+    assertEquals(writes.length, 2);
+    // Both runs write the same instance, so the resource tracks the object
+    // rather than accumulating one entry per version.
+    assertEquals(writes[0].name, writes[1].name);
+    const data = ObjectSchema.parse(writes[1].data);
+    assertEquals(data.head, "v2");
+    assertEquals(data.versionCount, 2);
+    assertEquals(data.state.map((entry) => entry.logicalPath), [
+      "a.txt",
+      "b.txt",
+    ]);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+Deno.test("create_version dry run writes no resource and no storage", async () => {
+  const repo = await writableRepo();
+  try {
+    const { context, writes } = fakeContext({
+      storage: "local",
+      path: repo.rootDir,
+    });
+    await model.methods.create_version.execute(
+      args(model.methods.create_version.arguments, {
+        id: "urn:example:dry",
+        ops: [`add:${await repo.source("a.txt", "alpha")}:a.txt`],
+        dryRun: true,
+        ...AGENT,
+      }),
+      context,
+    );
+
+    assertEquals(writes.length, 0);
+    // The object must not exist afterwards — a dry run that deposited anything
+    // would be worse than useless.
+    const storage = new LocalStorage(repo.rootDir);
+    const root = await openStorageRoot(storage);
+    assertEquals((await listObjects(root)).length, 0);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+Deno.test("create_version writes no resource when the commit fails", async () => {
+  const repo = await writableRepo();
+  try {
+    const { context, writes } = fakeContext({
+      storage: "local",
+      path: repo.rootDir,
+    });
+    await assertRejects(() =>
+      model.methods.create_version.execute(
+        args(model.methods.create_version.arguments, {
+          id: "urn:example:missing-source",
+          ops: ["add:/nonexistent/nope.txt:a.txt"],
+          ...AGENT,
+        }),
+        context,
+      )
+    );
+    assertEquals(writes.length, 0);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+Deno.test("create_version requires a user for provenance", () => {
+  // W007 wants name and address, and an anonymous version cannot be corrected
+  // after the fact — so the schema refuses rather than omitting the block.
+  assertThrows(() =>
+    model.methods.create_version.arguments.parse({
+      id: "urn:example:anon",
+      ops: ["add:/tmp/a.txt:a.txt"],
+    })
+  );
+});
+
+Deno.test("create_version accepts ops as one newline-delimited string", () => {
+  const parsed = model.methods.create_version.arguments.parse({
+    id: "urn:example:multiline",
+    ops: "add:/tmp/a.txt:a.txt\nremove:b.txt",
+    ...AGENT,
+  });
+  assertEquals(parsed.ops, "add:/tmp/a.txt:a.txt\nremove:b.txt");
+  assertEquals(parsed.dryRun, false);
+  assertEquals(parsed.allowNoChange, false);
 });
 
 Deno.test("createStorage rejects a local root without a path", () => {
