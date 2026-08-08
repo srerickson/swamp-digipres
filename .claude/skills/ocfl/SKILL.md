@@ -18,15 +18,24 @@ before applying a requirement.
 |----------|-----------|
 | `references/ocfl-spec-1.1.md` | Full normative v1.1 spec. Key sections: §3.3 version directories, §3.5 inventory, §3.6–3.7 inventory digests, §4 storage root |
 | `references/ocfl-spec-1.0.html` | Full published normative v1.0 specification (unaltered HTML) |
+| `references/validation-codes.md` | Lookup table of every `E###` (MUST) and `W###` (SHOULD) code with its requirement text — use it to name findings and to check what a code actually asserts |
+| `references/implementation-notes.md` | Non-normative guidance: §1 digital preservation, §2 storage (incl. object-store/S3 concerns), §3 client behaviors |
 | `references/transactions.md` | Modeling a create/update as an interruptible, resumable, revertible transaction (POSIX + S3) |
-| <https://ocfl.io/1.1/spec/validation-codes.html> | Meaning of v1.1 `E###` (error) / `W###` (warning) codes embedded in the spec text |
-| <https://ocfl.io/1.0/spec/> | Canonical published v1.0 specification and validation-code meanings |
-| <https://ocfl.github.io/extensions/> | Registered extensions, incl. storage layouts (`0002-flat-direct`, `0003-hash-and-id-n-tuple`, `0004-hashed-n-tuple`) |
-| <https://ocfl.io/1.1/implementation-notes/> | Non-normative guidance (client behaviors, versioning strategy, storage) |
+| `references/extensions/` | The registered community extensions, one file per extension (see below) |
+| <https://ocfl.github.io/extensions/> | Check for extensions registered after this bundle was captured |
 
 When in doubt about a MUST/SHOULD, inspect the spec matching the object's
-version. Both bundled sources carry validation codes inline as HTML spans
-(for example, `<span id="E064" ...>`).
+version. Both bundled specs carry validation codes inline as HTML spans
+(for example, `<span id="E064" ...>`); `references/validation-codes.md`
+resolves a bare code to its requirement without searching the spec.
+
+### Bundled extensions
+
+`references/extensions/` holds the registered specifications. Storage layouts
+(`0002`, `0003`, `0004`, `0006`, `0007`, `0010`, `0011`, `0012`) define id →
+path mapping; read the one named in `ocfl_layout.json` rather than inferring
+the algorithm. The rest cover digest algorithms (`0001`, `0009`), mutable head
+(`0005`), the schema registry (`0008`), and the extension template (`0000`).
 
 ## Anatomy
 
@@ -86,8 +95,9 @@ hand-rolling these steps; use the steps to drive or verify the tool.
 
 ### Locate an object
 
-Read `ocfl_layout.json` → apply the named layout extension to map id → path.
-If absent, check `extensions/` for a layout config, else walk the hierarchy
+Read `ocfl_layout.json` → apply the named layout extension (its spec is in
+`references/extensions/`) to map id → path. If absent, check the storage
+root's own `extensions/` for a layout config, else walk the hierarchy
 for `0=ocfl_object_*` namaste files. After resolving, confirm
 `inventory.json` `id` matches the requested id — never trust the path alone.
 
@@ -135,8 +145,9 @@ version than its predecessor (E103), and never later than the storage root's.
 ### Validate
 
 Use a real validator when available (e.g. `rocfl validate`,
-`ocfl-py`'s `ocfl-validate.py`); report findings by their E/W codes. Core
-checks, roughly cheapest first:
+`ocfl-py`'s `ocfl-validate.py`); report findings by their E/W codes, resolving
+each against `references/validation-codes.md`. Core checks, roughly cheapest
+first:
 
 - namaste files present with exact expected content
 - inventory parses, has all required keys and no unknown ones (E102)
