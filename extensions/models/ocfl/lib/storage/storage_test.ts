@@ -60,6 +60,34 @@ function forEachBackend(
   }
 }
 
+/** Drain a stream, keeping each chunk's size alongside the joined bytes. */
+async function collectChunked(
+  stream: ReadableStream<Uint8Array>,
+): Promise<{ bytes: Uint8Array; chunks: number[] }> {
+  const parts: Uint8Array[] = [];
+  const chunks: number[] = [];
+  for await (const chunk of stream) {
+    parts.push(chunk);
+    chunks.push(chunk.byteLength);
+  }
+  const bytes = new Uint8Array(
+    parts.reduce((total, part) => total + part.byteLength, 0),
+  );
+  let offset = 0;
+  for (const part of parts) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  return { bytes, chunks };
+}
+
+/** Drain a stream into one buffer. */
+async function collect(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Uint8Array> {
+  return (await collectChunked(stream)).bytes;
+}
+
 forEachBackend("write then read round-trips", async (storage) => {
   await storage.write("a/b/c.txt", encoder.encode("hello"));
   assertEquals(decoder.decode(await storage.read("a/b/c.txt")), "hello");
@@ -74,6 +102,56 @@ forEachBackend("read of a missing path throws NotFound", async (storage) => {
   const error = await assertRejects(() => storage.read("nope.txt"));
   assert(isNotFound(error), `expected NotFoundError, got ${error}`);
 });
+
+forEachBackend("readStream round-trips a small file", async (storage) => {
+  await storage.write("a/b/c.txt", encoder.encode("hello"));
+  const bytes = await collect(await storage.readStream("a/b/c.txt"));
+  assertEquals(decoder.decode(bytes), "hello");
+});
+
+forEachBackend("readStream handles an empty file", async (storage) => {
+  await storage.write("empty.txt", new Uint8Array(new ArrayBuffer(0)));
+  const { bytes, chunks } = await collectChunked(
+    await storage.readStream("empty.txt"),
+  );
+  assertEquals(bytes.byteLength, 0);
+  // An empty file is zero chunks and a clean close, not a zero-length chunk
+  // forever: a consumer looping until `done` must terminate.
+  assertEquals(chunks.filter((size) => size > 0).length, 0);
+});
+
+forEachBackend(
+  "readStream matches read over more than one chunk",
+  async (storage) => {
+    // Half a mebibyte of a non-repeating pattern: large enough that every
+    // backend hands it back in several chunks, and structured so a truncated,
+    // duplicated, or reordered chunk changes the bytes rather than hiding in a
+    // run of identical ones.
+    const source = new Uint8Array(new ArrayBuffer(512 * 1024));
+    for (let index = 0; index < source.byteLength; index += 1) {
+      source[index] = (index * 31 + (index >> 8)) & 0xff;
+    }
+    await storage.write("big.bin", source);
+
+    const { bytes, chunks } = await collectChunked(
+      await storage.readStream("big.bin"),
+    );
+    assert(
+      chunks.length > 1,
+      `expected more than one chunk, got ${chunks.length}`,
+    );
+    assertEquals(bytes, source);
+    assertEquals(bytes, await storage.read("big.bin"));
+  },
+);
+
+forEachBackend(
+  "readStream of a missing path throws NotFound",
+  async (storage) => {
+    const error = await assertRejects(() => storage.readStream("nope.txt"));
+    assert(isNotFound(error), `expected NotFoundError, got ${error}`);
+  },
+);
 
 forEachBackend("exists is false for missing paths", async (storage) => {
   assertEquals(await storage.exists("nope.txt"), false);

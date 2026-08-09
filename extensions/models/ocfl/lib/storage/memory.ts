@@ -11,6 +11,9 @@ import { NotFoundError } from "../errors.ts";
 import type { Bytes, Entry, Storage } from "./types.ts";
 import { walkFilesViaListDir } from "./walk.ts";
 
+/** Bytes per chunk emitted by {@linkcode MemoryStorage.readStream}. */
+const CHUNK_SIZE = 64 * 1024;
+
 /** A storage root held entirely in memory. */
 export class MemoryStorage implements Storage {
   readonly backend = "local" as const;
@@ -43,6 +46,32 @@ export class MemoryStorage implements Storage {
     const bytes = this.#files.get(normalize(path));
     if (bytes === undefined) return Promise.reject(new NotFoundError(path));
     return Promise.resolve(bytes.slice());
+  }
+
+  /**
+   * Deliver the stored bytes in {@linkcode CHUNK_SIZE} pieces.
+   *
+   * A single-chunk stream would be the obvious implementation, but then this
+   * backend would be the one place a consumer that only reads the first chunk
+   * still passes — the opposite of what this backend exists for.
+   */
+  readStream(path: string): Promise<ReadableStream<Uint8Array>> {
+    const bytes = this.#files.get(normalize(path));
+    if (bytes === undefined) return Promise.reject(new NotFoundError(path));
+    let offset = 0;
+    return Promise.resolve(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          const end = Math.min(offset + CHUNK_SIZE, bytes.byteLength);
+          controller.enqueue(bytes.slice(offset, end));
+          offset = end;
+        },
+      }),
+    );
   }
 
   exists(path: string): Promise<boolean> {

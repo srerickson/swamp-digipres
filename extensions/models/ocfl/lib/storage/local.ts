@@ -58,6 +58,21 @@ export class LocalStorage implements Storage {
     }
   }
 
+  async readStream(path: string): Promise<ReadableStream<Uint8Array>> {
+    let file: Deno.FsFile;
+    try {
+      file = await Deno.open(this.#resolve(path), { read: true });
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) {
+        throw new NotFoundError(path, { cause: error });
+      }
+      throw error;
+    }
+    // `readable` closes the file when the stream ends, is cancelled, or errors,
+    // so the descriptor is the stream's to own from here.
+    return file.readable;
+  }
+
   async exists(path: string): Promise<boolean> {
     try {
       const info = await Deno.stat(this.#resolve(path));
