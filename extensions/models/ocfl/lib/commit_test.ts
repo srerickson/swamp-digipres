@@ -584,6 +584,7 @@ function failOn(storage: Storage, needle: string): Storage {
     location: storage.location,
     backend: storage.backend,
     read: (path: string) => storage.read(path),
+    readStream: (path: string) => storage.readStream(path),
     exists: (path: string) => storage.exists(path),
     listDir: (path: string): Promise<Entry[]> => storage.listDir(path),
     walkFiles: (prefix: string) => storage.walkFiles(prefix),

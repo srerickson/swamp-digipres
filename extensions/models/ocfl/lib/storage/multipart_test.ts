@@ -1,5 +1,6 @@
 /**
- * Tests for the S3 write path, driven through a stubbed `fetch`.
+ * Tests for the S3 backend's request handling, driven through a stubbed
+ * `fetch`.
  *
  * `aws4fetch` signs and then calls the global `fetch`, so replacing it captures
  * exactly the request sequence a real bucket would receive. That is the only
@@ -7,6 +8,7 @@
  * correctly, and whether a failure cleans up after itself.
  */
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import { isNotFound } from "../errors.ts";
 import { S3Storage } from "./s3.ts";
 import { completeMultipartUploadBody, firstTag } from "./xml.ts";
 
@@ -301,6 +303,67 @@ Deno.test("writeStream reports a CompleteMultipartUpload error inside a 200", as
       Error,
       "CompleteMultipartUpload failed",
     );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("readStream hands back the GET body unbuffered", async () => {
+  // A response body that stays open until the test releases it: an
+  // implementation that buffered the way `read` does could not have resolved
+  // yet, which is the whole point of the method.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const encoder = new TextEncoder();
+  const { calls, restore } = stubFetch(() =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(encoder.encode("first-"));
+          await held;
+          controller.enqueue(encoder.encode("second"));
+          controller.close();
+        },
+      }),
+      { status: 200 },
+    )
+  );
+
+  const stalled = Symbol("stalled");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<typeof stalled>((resolve) => {
+      timer = setTimeout(() => resolve(stalled), 5_000);
+    });
+    const stream = await Promise.race([
+      new S3Storage(OPTIONS).readStream("v1/content/a.txt"),
+      deadline,
+    ]);
+    clearTimeout(timer);
+    assert(stream !== stalled, "readStream waited for the body to finish");
+
+    release();
+    assertEquals(await new Response(stream).text(), "first-second");
+  } finally {
+    clearTimeout(timer);
+    release();
+    restore();
+  }
+
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0].method, "GET");
+  assert(calls[0].url.pathname.endsWith("/v1/content/a.txt"));
+});
+
+Deno.test("readStream maps a 404 to NotFoundError", async () => {
+  const { restore } = stubFetch(() => new Response(null, { status: 404 }));
+  try {
+    const error = await assertRejects(() =>
+      new S3Storage(OPTIONS).readStream("v1/content/gone.txt")
+    );
+    assert(isNotFound(error), `expected NotFoundError, got ${error}`);
   } finally {
     restore();
   }

@@ -45,6 +45,17 @@ export interface Storage {
    */
   read(path: string): Promise<Bytes>;
 
+  /**
+   * Open a file for streaming, without holding it in memory.
+   *
+   * The read-side counterpart to {@linkcode writeStream}, and the only way to
+   * get content out of an object: a preservation repository holds TIFFs and
+   * video, which {@linkcode read} would buffer whole.
+   *
+   * @throws {import("../errors.ts").NotFoundError} when the path is absent.
+   */
+  readStream(path: string): Promise<ReadableStream<Uint8Array>>;
+
   /** Whether a file exists at `path`. Directories are not files. */
   exists(path: string): Promise<boolean>;
 

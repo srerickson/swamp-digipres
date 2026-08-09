@@ -125,7 +125,13 @@ export class S3Storage implements Storage {
     return response;
   }
 
-  async read(path: string): Promise<Bytes> {
+  /**
+   * `GET` an object, leaving the body untouched for the caller to consume.
+   *
+   * Buffered and streaming reads share this so they issue the same request
+   * through the same retry wrapper, and so a missing key fails identically.
+   */
+  async #get(path: string): Promise<Response> {
     const response = await this.#send(this.#url(this.#key(path)));
     if (response.status === 404) {
       // Drain so the connection can be reused.
@@ -135,7 +141,19 @@ export class S3Storage implements Storage {
     if (!response.ok) {
       throw await s3Error("GET", path, response);
     }
+    return response;
+  }
+
+  async read(path: string): Promise<Bytes> {
+    const response = await this.#get(path);
     return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async readStream(path: string): Promise<ReadableStream<Uint8Array>> {
+    const response = await this.#get(path);
+    // `fetch` omits the body on a zero-length response; the caller asked for a
+    // stream either way.
+    return response.body ?? emptyStream();
   }
 
   async exists(path: string): Promise<boolean> {
@@ -468,6 +486,15 @@ async function* partition(
   } finally {
     reader.releaseLock();
   }
+}
+
+/** A stream that closes without yielding anything. */
+function emptyStream(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.close();
+    },
+  });
 }
 
 /** Strip leading and trailing slashes from a configured key prefix. */
