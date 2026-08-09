@@ -6,7 +6,7 @@ repository. Modeled on the PREMIS controlled vocabulary.
 
 ## Tools
 
-- OCFL CLI (`go install github.com/srerickson/ocfl-tools/cmd/ocfl@latest`): `ocfl --help` 
+- Use ocfl cli (`go install github.com/srerickson/ocfl-tools/cmd/ocfl@latest`): `ocfl --help` 
 
 
 <!-- BEGIN swamp managed section - DO NOT EDIT -->

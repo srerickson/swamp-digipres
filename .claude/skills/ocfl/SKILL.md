@@ -20,7 +20,6 @@ before applying a requirement.
 | `references/ocfl-spec-1.0.html` | Full published normative v1.0 specification (unaltered HTML) |
 | `references/validation-codes.md` | Lookup table of every `E###` (MUST) and `W###` (SHOULD) code with its requirement text — use it to name findings and to check what a code actually asserts |
 | `references/implementation-notes.md` | Non-normative guidance: §1 digital preservation, §2 storage (incl. object-store/S3 concerns), §3 client behaviors |
-| `references/transactions.md` | Modeling a create/update as an interruptible, resumable, revertible transaction (POSIX + S3) |
 | `references/extensions/` | The registered community extensions, one file per extension (see below) |
 | <https://ocfl.github.io/extensions/> | Check for extensions registered after this bundle was captured |
 
@@ -130,8 +129,8 @@ for `0=ocfl_object_*` namaste files. After resolving, confirm
    hasn't moved immediately before step 6.
 
 For anything that must survive interruption — resumable ingest, crash recovery,
-rollback, concurrent writers — follow `references/transactions.md`. In brief:
-serialize the new inventory once and cache the bytes before any storage write;
+rollback, concurrent writers — serialize the new inventory once and cache the
+bytes before any storage write;
 write directly to final paths (same code path for POSIX and S3); always write
 `vN+1/inventory.json` + sidecar before touching the root, so an interrupted
 commit is self-describing; treat the **root sidecar** as the sole commit point;
@@ -169,8 +168,8 @@ Two distinct operations — always confirm which one is intended, and run
   `state` omits the paths. Content remains in prior versions and stays
   recoverable; the manifest keeps its entries. This is a normal update.
 - **Abort (uncommitted):** if a create/update is still in flight, remove the
-  target version directory and restore the root inventory — see
-  `references/transactions.md` §9.1. Distinct from both cases below.
+  target version directory and restore the root inventory. Distinct from both
+  cases below.
 - **Purge (destructive, outside the spec):** removing content from history
   or deleting a whole object means removing the object root (plus any
   now-empty parent directories, since empty dirs are forbidden) or rebuilding

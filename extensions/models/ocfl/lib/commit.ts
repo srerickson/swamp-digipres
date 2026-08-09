@@ -10,10 +10,9 @@
  *
  * This deviates from the OCFL implementation notes in one respect: there is no
  * staging tree. Content streams from the caller's source paths straight to its
- * final `vN/<contentDirectory>/…` location. `references/transactions.md` §2
- * ratifies that ("Write directly to final paths… One code path for POSIX and
- * S3") and §8.2 documents the cost — a bounded window in which a third-party
- * validator would report E046, ending when the root sidecar lands.
+ * final `vN/<contentDirectory>/…` location — one code path for POSIX and S3, at
+ * the cost of a bounded window in which a third-party validator would report
+ * E046, ending when the root sidecar lands.
  *
  * @module
  */
@@ -436,10 +435,9 @@ export type CommitContext = {
 /**
  * Execute a plan.
  *
- * The write order is fixed and load-bearing (`references/transactions.md` §8):
- * conformance declaration first for a new object, then content, then the
- * version inventory and its sidecar, then the root inventory and — as the
- * single commit point — the root sidecar.
+ * The write order is fixed and load-bearing: conformance declaration first for
+ * a new object, then content, then the version inventory and its sidecar, then
+ * the root inventory and — as the single commit point — the root sidecar.
  *
  * @throws {OcflError} on drift, digest mismatch, or a concurrent head move.
  *   Storage is cleaned back to its prior state on a best-effort basis.

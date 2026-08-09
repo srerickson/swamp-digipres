@@ -166,10 +166,10 @@ Deduplication is automatic: only digests absent from the manifest get content
 files, so an unchanged file in a new version resolves back to its original
 version's content path, and a `rename` transfers no bytes.
 
-The write order follows `references/transactions.md` §8 and is not negotiable:
-conformance declaration first for a new object, then content, then
-`vN/inventory.json` and its sidecar, then the root inventory and — as the single
-commit point — the root sidecar, with nothing between those last two. Sources
+The write order is not negotiable: conformance declaration first for a new
+object, then content, then `vN/inventory.json` and its sidecar, then the root
+inventory and — as the single commit point — the root sidecar, with nothing
+between those last two. Sources
 are digested at plan time and re-verified as they are written, so a source that
 changed in between is a fatal error rather than a silent substitution. The root
 inventory is re-read immediately before the commit and compared against the
@@ -182,7 +182,7 @@ verified it was empty and claimed it. Content bytes are written directly to
 their final paths rather than staged and moved, so an interrupted run leaves a
 version directory a third-party validator would flag (E046) until rollback
 completes. There is **no durable transaction log**: a crashed process does not
-resume, and recovery is manual per `references/transactions.md` §11.
+resume, and recovery is manual.
 
 ## Large files
 

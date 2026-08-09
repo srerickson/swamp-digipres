@@ -85,8 +85,7 @@ export type DigestingStream = {
  *
  * Verifying the write itself, rather than re-reading the source, is what
  * catches source drift that slipped past the size+mtime check and corruption in
- * transit (`references/transactions.md` §7). It costs one hash over data
- * already in memory.
+ * transit. It costs one hash over data already in memory.
  *
  * @throws {Error} when the algorithm is not one OCFL names.
  */
