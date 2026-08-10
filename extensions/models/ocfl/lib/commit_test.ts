@@ -14,32 +14,28 @@ import { commitVersion, planVersion } from "./commit.ts";
 import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import { readInventory, sidecarName } from "./inventory.ts";
-import { HASHED_N_TUPLE } from "./layout.ts";
 import { openObjectAt, resolveState } from "./object.ts";
 import { parseOps } from "./ops.ts";
 import type { StorageRoot } from "./root.ts";
 import { MemoryStorage } from "./storage/memory.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
-import { forEachBackend, type Harness, harness } from "./testing.ts";
+import {
+  commit as commitTo,
+  forEachBackend,
+  harness,
+  USER,
+} from "./testing.ts";
 
 const ID = "urn:example:obj-1";
-const USER = { userName: "Test Agent", userAddress: "mailto:test@example.com" };
 
-/** Plan and commit in one step, with the required provenance filled in. */
-async function commit(
+/** Plan and commit in one step, against this file's object. */
+function commit(
   root: StorageRoot,
   ops: string[],
   options: Record<string, unknown> = {},
 ) {
-  const plan = await planVersion(root, {
-    id: ID,
-    ops: parseOps(ops),
-    ...USER,
-    ...options,
-  });
-  await commitVersion(root, plan);
-  return plan;
+  return commitTo(root, ID, ops, options);
 }
 
 forEachBackend("creates a new object at v1", async ({ root, source }) => {

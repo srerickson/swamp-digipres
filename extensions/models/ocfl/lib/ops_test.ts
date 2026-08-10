@@ -205,6 +205,28 @@ Deno.test("validatePaths rejects a path that is a prefix of another (E101)", () 
   assert(error.message.includes("both a file and a directory"));
 });
 
+Deno.test("validatePaths finds a prefix conflict its neighbours hide (E101)", () => {
+  // '!' (0x21) sorts before '/' (0x2F), so sorting these puts "a!b" between
+  // "a" and "a/x" and a check that only compares neighbours never sees the
+  // conflict. Both the write path and the export path rely on this catching
+  // every file-that-is-also-a-directory before anything is written.
+  for (const paths of [["a", "a!b", "a/x"], ["a/x", "a!b", "a"]]) {
+    const error = assertThrows(
+      () => validatePaths(paths, "logical"),
+      OcflError,
+    );
+    assertEquals(error.code, "E101");
+    assert(error.message.includes("both a file and a directory"));
+  }
+
+  // Depth is no help to it either: the conflict can be several levels up.
+  const deep = assertThrows(
+    () => validatePaths(["docs", "docs!notes", "docs/deep/spec.md"], "logical"),
+    OcflError,
+  );
+  assertEquals(deep.code, "E101");
+});
+
 Deno.test("validatePaths rejects duplicates but allows a shared prefix string", () => {
   assertThrows(
     () => validatePaths(["a.txt", "a.txt"], "logical"),

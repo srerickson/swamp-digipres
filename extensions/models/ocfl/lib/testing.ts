@@ -1,5 +1,8 @@
 /**
- * Shared fixtures for the write-path tests.
+ * Shared fixtures for the library tests.
+ *
+ * The write path is what most of this builds, but the read-path tests need
+ * objects to read, so they build them the same way.
  *
  * Test-only. Nothing here is reachable from `mod.ts`, so it never enters the
  * extension bundle, and the filename does not match Deno's test-file patterns,
@@ -7,7 +10,9 @@
  *
  * @module
  */
+import { commitVersion, planVersion } from "./commit.ts";
 import { HASHED_N_TUPLE } from "./layout.ts";
+import { parseOps } from "./ops.ts";
 import { initStorageRoot, type StorageRoot } from "./root.ts";
 import { LocalStorage } from "./storage/local.ts";
 import { MemoryStorage } from "./storage/memory.ts";
@@ -62,6 +67,34 @@ export async function harness(backend: Backend): Promise<Harness> {
       }
     },
   };
+}
+
+/** Provenance every test commit carries, since `planVersion` requires it. */
+export const USER = {
+  userName: "Test Agent",
+  userAddress: "mailto:test@example.com",
+};
+
+/**
+ * Plan and commit one version, with the required provenance filled in.
+ *
+ * Shared rather than copied per test file: it tracks `planVersion`'s required
+ * arguments, so a second copy would drift the moment those change.
+ */
+export async function commit(
+  root: StorageRoot,
+  id: string,
+  ops: string[],
+  options: Record<string, unknown> = {},
+) {
+  const plan = await planVersion(root, {
+    id,
+    ops: parseOps(ops),
+    ...USER,
+    ...options,
+  });
+  await commitVersion(root, plan);
+  return plan;
 }
 
 /** Register one test per backend, each with a fresh harness. */

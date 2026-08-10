@@ -11,38 +11,28 @@
  * must produce the same tree.
  */
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
-import { commitVersion, planVersion } from "./commit.ts";
 import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import { planExport, runExport } from "./export.ts";
 import { findObject } from "./object.ts";
-import { parseOps } from "./ops.ts";
 import { openStorageRoot, type StorageRoot } from "./root.ts";
 import { LocalStorage } from "./storage/local.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
-import { forEachBackend, type Harness } from "./testing.ts";
+import { commit as commitTo, forEachBackend, type Harness } from "./testing.ts";
 
 const ID = "urn:example:export-1";
-const USER = { userName: "Test Agent", userAddress: "mailto:test@example.com" };
 
 const FIXTURE =
   new URL("../../../../testdata/fixtures/ocfl-root", import.meta.url).pathname;
 
-/** Commit a version, with the required provenance filled in. */
-async function commit(
+/** Commit a version, against this file's object. */
+function commit(
   root: StorageRoot,
   ops: string[],
   options: Record<string, unknown> = {},
 ) {
-  const plan = await planVersion(root, {
-    id: ID,
-    ops: parseOps(ops),
-    ...USER,
-    ...options,
-  });
-  await commitVersion(root, plan);
-  return plan;
+  return commitTo(root, ID, ops, options);
 }
 
 /** Plan and run an export in one step. */
@@ -239,6 +229,142 @@ forEachBackend(
     assertEquals(await Deno.readTextFile(`${dest}/one.txt`), identical);
     assertEquals(await Deno.readTextFile(`${dest}/copies/two.txt`), identical);
     assert(files.every((file) => file.verified));
+  },
+);
+
+forEachBackend(
+  "re-exporting leaves a deduplicated copy alone too",
+  async (harness) => {
+    const { root, source, scratch } = harness;
+    const identical = "identical bytes";
+    await commit(root, [
+      `add:${await source("one.txt", identical)}:one.txt`,
+      `add:${await source("two.txt", identical)}:copies/two.txt`,
+    ]);
+
+    const dest = await scratch();
+    await exportTo(root, dest);
+    const before = await Promise.all(
+      ["one.txt", "copies/two.txt"].map(async (path) =>
+        (await Deno.stat(`${dest}/${path}`)).mtime?.getTime()
+      ),
+    );
+
+    // The copy is subject to the same skip-if-already-right rule as the fetch
+    // it duplicates; re-running must not rewrite it.
+    const { storage, root: counted } = await countingRoot(harness);
+    const plan = await planExport(counted, { id: ID, dest });
+    const files = await runExport(counted, plan);
+
+    assertEquals(storage.readStreams(), 0);
+    assertEquals(files.map((file) => file.source), ["existing", "existing"]);
+    const after = await Promise.all(
+      ["one.txt", "copies/two.txt"].map(async (path) =>
+        (await Deno.stat(`${dest}/${path}`)).mtime?.getTime()
+      ),
+    );
+    assertEquals(after, before);
+  },
+);
+
+forEachBackend(
+  "a corrupted deduplicated copy is replaced, not reported as existing",
+  async ({ root, source, scratch }) => {
+    const identical = "identical bytes";
+    await commit(root, [
+      `add:${await source("one.txt", identical)}:one.txt`,
+      `add:${await source("two.txt", identical)}:copies/two.txt`,
+    ]);
+
+    const dest = await scratch();
+    await exportTo(root, dest);
+    // `one.txt` is the duplicate: truncate it the way an interrupted write
+    // would have.
+    await Deno.writeTextFile(`${dest}/one.txt`, "ident");
+
+    const files = await exportTo(root, dest);
+
+    assertEquals(files.map((file) => file.source), ["existing", "copied"]);
+    assertEquals(await Deno.readTextFile(`${dest}/one.txt`), identical);
+    assertEquals(await tree(dest), ["copies/two.txt", "one.txt"]);
+  },
+);
+
+forEachBackend(
+  "a deduplicated copy is verified, and a bad one places nothing",
+  async ({ root, source, scratch }) => {
+    const identical = "identical bytes";
+    await commit(root, [
+      `add:${await source("one.txt", identical)}:one.txt`,
+      `add:${await source("two.txt", identical)}:copies/two.txt`,
+    ]);
+
+    const dest = await scratch();
+    const plan = await planExport(root, { id: ID, dest });
+
+    // Point the copy at bytes that are not the ones the manifest records — what
+    // a source modified between the fetch pass and the copy pass looks like.
+    // Copies used to inherit their source's verification on trust.
+    const copy = plan.entries.find((entry) => entry.copyFrom !== undefined);
+    assert(copy !== undefined);
+    copy.copyFrom = await source("tampered.txt", "not the identical bytes");
+
+    const error = await assertRejects(() => runExport(root, plan), OcflError);
+    assertEquals(error.code, "E092");
+    assert(error.message.includes("one.txt"));
+
+    // The fetch landed; the copy left neither a bad file nor a temp file.
+    const placed = await tree(dest);
+    assertEquals(placed, ["copies/two.txt"]);
+    assertEquals(placed.filter((path) => path.includes(".part")), []);
+  },
+);
+
+forEachBackend(
+  "a version whose state is empty exports no files",
+  async ({ root, source, scratch }) => {
+    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, ["remove:a.txt"]);
+
+    const dest = await scratch();
+    const plan = await planExport(root, { id: ID, dest });
+    assertEquals(plan.version, "v2");
+    assertEquals(plan.entries, []);
+
+    // Removing every file leaves a legitimate version, not an unexportable one.
+    assertEquals(await runExport(root, plan), []);
+    assertEquals(await tree(dest), []);
+  },
+);
+
+forEachBackend(
+  "a directory sitting at a logical file's destination is reported by path",
+  async ({ root, source, scratch }) => {
+    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+
+    const dest = await scratch();
+    // Left behind by staging a version where `a.txt` was itself a directory.
+    await Deno.mkdir(`${dest}/a.txt`);
+
+    const error = await assertRejects(() => exportTo(root, dest), OcflError);
+    assert(error.message.includes("a.txt"));
+    assert(error.message.includes("is a directory"));
+  },
+);
+
+forEachBackend(
+  "a destination is one destination however it is spelled",
+  async ({ root, source, scratch }) => {
+    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    const dest = await scratch();
+
+    // The export resource's instance name digests `plan.dest`, so a trailing
+    // or doubled slash must not mint a second manifest for one directory.
+    for (const spelling of [dest, `${dest}/`, `${dest}//`, `${dest}/`]) {
+      const plan = await planExport(root, { id: ID, dest: spelling });
+      assertEquals(plan.dest, dest);
+      assertEquals(plan.entries[0].destPath, `${dest}/a.txt`);
+    }
   },
 );
 

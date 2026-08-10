@@ -30,15 +30,30 @@ import { joinPath } from "./storage/types.ts";
 export const DEFAULT_CONCURRENCY = 4;
 
 /**
+ * Reduce a destination directory to one spelling.
+ *
+ * `/work/staging` and `/work/staging//` are the same directory, but the export
+ * resource's instance name digests this string, so leaving both spellings alive
+ * would mint two manifests for one staging directory. Normalising here — before
+ * the plan records it — is what makes a re-export update its manifest in place
+ * however the caller spelled the path.
+ */
+function normalizeDest(dest: string): string {
+  const collapsed = dest.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+  return collapsed === "" ? "/" : collapsed;
+}
+
+/**
  * Append a validated logical path to the destination directory.
  *
  * No path library, for the reason `storage/local.ts` gives: Deno accepts `/` on
  * every platform it supports, and the bundler would inline the dependency for
  * nothing. Safe because {@linkcode validatePaths} has already rejected empty,
- * `.`, `..`, and absolute logical paths.
+ * `.`, `..`, and absolute logical paths, and `dest` has been through
+ * {@linkcode normalizeDest}.
  */
 function destinationFor(dest: string, logicalPath: string): string {
-  return `${dest.replace(/\/+$/, "")}/${logicalPath}`;
+  return dest === "/" ? `/${logicalPath}` : `${dest}/${logicalPath}`;
 }
 
 /** Everything before the last `/`. */
@@ -131,6 +146,7 @@ export async function planExport(
       }`,
     );
   }
+  const dest = normalizeDest(options.dest);
 
   const object = await findObject(root, options.id);
   const version = options.version ?? object.inventory.head;
@@ -142,10 +158,13 @@ export async function planExport(
   // outside the destination or over its own siblings.
   validatePaths(state.map((file) => file.logicalPath), "logical");
 
+  // An empty selection is only an error when `only` asked for something that
+  // is not there. A version whose state is empty — every file removed — is a
+  // legitimate OCFL version, and exporting it means writing no files.
   const selected = options.only === undefined
     ? state
     : state.filter((file) => file.logicalPath === options.only);
-  if (selected.length === 0) {
+  if (options.only !== undefined && selected.length === 0) {
     throw new OcflError(
       `${options.id} has no logical path ${JSON.stringify(options.only)} in ` +
         `${version}; that version holds ${state.length} file(s)`,
@@ -153,13 +172,13 @@ export async function planExport(
     );
   }
 
-  await requireDirectoryOrAbsent(options.dest);
+  await requireDirectoryOrAbsent(dest);
 
   // First entry for a digest fetches; the rest copy from it once it has landed.
   const fetchedFor = new Map<string, string>();
   const entries: ExportEntry[] = [];
   for (const file of selected) {
-    const destPath = destinationFor(options.dest, file.logicalPath);
+    const destPath = destinationFor(dest, file.logicalPath);
     const already = fetchedFor.get(file.digest.toLowerCase());
     if (already !== undefined) {
       entries.push({
@@ -186,7 +205,7 @@ export async function planExport(
     objectPath: object.path,
     version,
     digestAlgorithm: object.inventory.digestAlgorithm,
-    dest: options.dest,
+    dest,
     entries,
   };
 }
@@ -307,27 +326,20 @@ async function pool<T>(
   if (failure !== undefined) throw failure;
 }
 
-/** Place one file, fetching, copying, or leaving it alone as the plan says. */
+/**
+ * Place one file, fetching, copying, or leaving it alone as the plan says.
+ *
+ * A copy differs from a fetch in exactly one respect — where its bytes are read
+ * from — so the two share everything after that: the same skip-if-already-right
+ * check, the same verified temp-and-rename write. Deduplication being cheaper
+ * than a second download must not also make it less safe.
+ */
 async function placeEntry(
   root: StorageRoot,
   plan: ExportPlan,
   entry: ExportEntry,
 ): Promise<ExportedFile> {
   await Deno.mkdir(parentOf(entry.destPath), { recursive: true });
-
-  if (entry.copyFrom !== undefined) {
-    // The source was digest-checked as it landed, so the copy inherits that.
-    await Deno.copyFile(entry.copyFrom, entry.destPath);
-    const info = await Deno.stat(entry.destPath);
-    return {
-      logicalPath: entry.logicalPath,
-      destPath: entry.destPath,
-      digest: entry.digest,
-      size: info.size,
-      source: "copied",
-      verified: true,
-    };
-  }
 
   const existing = await matchingExisting(entry, plan.digestAlgorithm);
   if (existing !== undefined) {
@@ -341,13 +353,15 @@ async function placeEntry(
     };
   }
 
-  const size = await fetchEntry(root, plan, entry);
+  const size = entry.copyFrom === undefined
+    ? await placeFromStorage(root, plan, entry)
+    : await placeFromSibling(plan, entry, entry.copyFrom);
   return {
     logicalPath: entry.logicalPath,
     destPath: entry.destPath,
     digest: entry.digest,
     size,
-    source: "fetched",
+    source: entry.copyFrom === undefined ? "fetched" : "copied",
     verified: true,
   };
 }
@@ -358,30 +372,77 @@ async function placeEntry(
  *
  * Hashing what is already on disk is what makes a re-export cost local reads
  * instead of a second transfer — the whole point of staging content.
+ *
+ * The directory case is detected by {@linkcode Deno.stat} rather than by
+ * catching an open failure: on Linux, opening a directory for reading
+ * *succeeds*, and the `EISDIR` only surfaces from the read, well past the point
+ * where the logical path is still in hand to name in the error.
  */
 async function matchingExisting(
   entry: ExportEntry,
   algorithm: string,
 ): Promise<{ size: number } | undefined> {
-  let file: Deno.FsFile;
+  let info: Deno.FileInfo;
   try {
-    file = await Deno.open(entry.destPath, { read: true });
+    info = await Deno.stat(entry.destPath);
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) return undefined;
-    if (error instanceof Deno.errors.IsADirectory) {
-      throw new OcflError(
-        `export destination ${entry.destPath} for logical path ` +
-          `${JSON.stringify(entry.logicalPath)} is a directory`,
-      );
-    }
     throw error;
   }
+  if (info.isDirectory) {
+    throw new OcflError(
+      `export destination ${entry.destPath} for logical path ` +
+        `${JSON.stringify(entry.logicalPath)} is a directory`,
+    );
+  }
+
+  const file = await Deno.open(entry.destPath, { read: true });
   const { digest, size } = await digestStream(file.readable, algorithm);
   return digestsEqual(digest, entry.digest) ? { size } : undefined;
 }
 
+/** Stream a content file out of storage to its destination. */
+function placeFromStorage(
+  root: StorageRoot,
+  plan: ExportPlan,
+  entry: ExportEntry,
+): Promise<number> {
+  // Set on every entry without a `copyFrom`: `resolveState` rejects a manifest
+  // digest that names no content path, so the plan cannot hold one.
+  const contentPath = entry.contentPath as string;
+  return placeStream(
+    plan,
+    entry,
+    () => root.storage.readStream(joinPath(plan.objectPath, contentPath)),
+    `content at ${contentPath}`,
+    contentPath,
+  );
+}
+
 /**
- * Stream one content file to its destination, verifying as it goes.
+ * Copy a destination this run already wrote to a second destination sharing its
+ * digest.
+ *
+ * Re-read and re-verified rather than handed to `Deno.copyFile`: the bytes are
+ * being read either way, and going through the same verified write means a
+ * duplicate gets the same atomicity as its original instead of appearing at its
+ * real path half-written.
+ */
+function placeFromSibling(
+  plan: ExportPlan,
+  entry: ExportEntry,
+  copyFrom: string,
+): Promise<number> {
+  return placeStream(
+    plan,
+    entry,
+    async () => (await Deno.open(copyFrom, { read: true })).readable,
+    `deduplicated copy source ${copyFrom}`,
+  );
+}
+
+/**
+ * Stream one file to its destination, verifying as it goes.
  *
  * The bytes land on a sibling temp path and are renamed in only once the digest
  * matches. Sibling rather than a temp directory so the rename stays on one
@@ -389,37 +450,53 @@ async function matchingExisting(
  * mismatch leaves nothing behind and a concurrent reader never sees a partial
  * file at a real destination.
  *
+ * @param open Opens the byte source. Called once, and its stream is always
+ *   either piped (which closes it) or cancelled.
+ * @param origin Names the source in a fixity error.
+ * @param errorPath Path recorded on a fixity error, when there is one worth
+ *   recording.
  * @returns Bytes written.
  */
-async function fetchEntry(
-  root: StorageRoot,
+async function placeStream(
   plan: ExportPlan,
   entry: ExportEntry,
+  open: () => Promise<ReadableStream<Uint8Array>>,
+  origin: string,
+  errorPath?: string,
 ): Promise<number> {
-  const contentPath = entry.contentPath as string;
   const temporary = `${parentOf(entry.destPath)}/.${nameOf(entry.destPath)}.${
     crypto.randomUUID().slice(0, 8)
   }.part`;
 
+  const source = await open();
+
+  // Opening the temp file can fail — an unwritable subtree, a full disk — and
+  // the source is already holding a descriptor or an HTTP body by then. Nothing
+  // else will ever consume it, so cancel it here; `pipeTo` takes over from the
+  // next line on.
+  let file: Deno.FsFile;
   try {
-    const digesting = digestingStream(plan.digestAlgorithm);
-    const source = await root.storage.readStream(
-      joinPath(plan.objectPath, contentPath),
-    );
-    const file = await Deno.open(temporary, {
+    file = await Deno.open(temporary, {
       write: true,
       create: true,
       truncate: true,
     });
+  } catch (error) {
+    await source.cancel().catch(() => {});
+    throw error;
+  }
+
+  try {
+    const digesting = digestingStream(plan.digestAlgorithm);
     await source.pipeThrough(digesting.stream).pipeTo(file.writable);
 
     const written = digesting.digest();
     if (!digestsEqual(written, entry.digest)) {
       throw new OcflError(
-        `content at ${contentPath} digests to ${written}, not the ` +
-          `${entry.digest} its manifest records; ${plan.id} fails fixity and ` +
-          `${entry.destPath} was not written`,
-        { code: "E092", path: contentPath },
+        `${origin} digests to ${written}, not the ${entry.digest} the ` +
+          `manifest records for ${JSON.stringify(entry.logicalPath)}; ` +
+          `${plan.id} fails fixity and ${entry.destPath} was not written`,
+        { code: "E092", path: errorPath },
       );
     }
 
