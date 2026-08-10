@@ -12,7 +12,7 @@
  */
 import { commitVersion, planVersion } from "./commit.ts";
 import { HASHED_N_TUPLE } from "./layout.ts";
-import { type OpsInput, parseOps, type VersionOp } from "./ops.ts";
+import { type OpsInput, parseOps } from "./ops.ts";
 import { initStorageRoot, type StorageRoot } from "./root.ts";
 import { LocalStorage } from "./storage/local.ts";
 import { MemoryStorage } from "./storage/memory.ts";
@@ -74,32 +74,6 @@ export const USER = {
   userName: "Test Agent",
   userAddress: "mailto:test@example.com",
 };
-
-/**
- * Terse constructors for the three operations.
- *
- * A test whose subject is planning or committing should not spend three lines
- * per operation restating a shape `ops_test.ts` already pins down. These are
- * type-checked against {@linkcode VersionOp}, so they cannot drift from it.
- */
-export const addOp = (source: string, logicalPath: string): VersionOp => ({
-  op: "add",
-  source,
-  logicalPath,
-});
-
-/** A `remove` operation. */
-export const removeOp = (logicalPath: string): VersionOp => ({
-  op: "remove",
-  logicalPath,
-});
-
-/** A `rename` operation. */
-export const renameOp = (from: string, to: string): VersionOp => ({
-  op: "rename",
-  from,
-  to,
-});
 
 /**
  * Plan and commit one version, with the required provenance filled in.

@@ -59,15 +59,27 @@ export const OpObjectSchema = z.discriminatedUnion("op", [
 export type VersionOp = z.infer<typeof OpObjectSchema>;
 
 /**
+ * Why an empty list is refused, stated once and enforced at both boundaries:
+ * by {@linkcode OpsInputSchema} for arguments arriving through swamp, and by
+ * {@linkcode parseOps} for callers reaching the library directly.
+ */
+const NO_OPS = "no operations given; a version must be described by at " +
+  "least one add, remove, or rename";
+
+/**
  * Every form the operation list may arrive in.
  *
  * A bare object is the single-operation convenience. swamp's
  * `--input key=value` does not accumulate repeated keys, so a list arrives
  * either as `ops:json=[…]` or as a YAML list via `--input-file`.
+ *
+ * The list may not be empty. Rejecting that here rather than only inside the
+ * planner is what keeps a step that computed its way to zero operations from
+ * opening storage and reading an inventory before it fails.
  */
 export const OpsInputSchema = z.union([
   OpObjectSchema,
-  z.array(OpObjectSchema),
+  z.array(OpObjectSchema).min(1, NO_OPS),
 ]);
 
 /** Accepted shape of the operation list, before validation. */
@@ -75,6 +87,25 @@ export type OpsInput = z.infer<typeof OpsInputSchema>;
 
 /** Logical path → digest. The working state ops are folded over. */
 export type LogicalState = Map<string, string>;
+
+/**
+ * Render a rejected value for an error message.
+ *
+ * `JSON.stringify` throws on a circular structure or a BigInt, and it returns
+ * `undefined` rather than a string for `undefined` itself. An error formatter
+ * that throws would replace the {@linkcode OcflError} the caller is prepared
+ * for with an unclassified `TypeError`, so anything it cannot render falls
+ * back to `Deno.inspect`, which renders every value.
+ */
+function describe(value: unknown): string {
+  try {
+    const json = JSON.stringify(value);
+    if (json !== undefined) return json;
+  } catch {
+    // Unrepresentable as JSON; the inspector below handles it.
+  }
+  return Deno.inspect(value);
+}
 
 /**
  * Validate one operation.
@@ -90,7 +121,7 @@ function parseOp(value: unknown): VersionOp {
     .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
     .join("; ");
   throw new OcflError(
-    `invalid operation ${JSON.stringify(value)}: ${issues}`,
+    `invalid operation ${describe(value)}: ${issues}`,
   );
 }
 
@@ -99,20 +130,48 @@ function parseOp(value: unknown): VersionOp {
  *
  * Accepts one operation or an array of them.
  *
+ * The parameter is `unknown` rather than {@linkcode OpsInput} because this is
+ * the boundary where untrusted data becomes typed: operations arrive as JSON
+ * or YAML, and a signature promising they are already the right shape would
+ * invite callers either to cast on the way in or to skip the check entirely.
+ *
  * @throws {OcflError} when the list is empty or any operation is malformed.
  */
-export function parseOps(input: OpsInput): VersionOp[] {
+export function parseOps(input: unknown): VersionOp[] {
   const items = Array.isArray(input) ? input : [input];
 
-  if (items.length === 0) {
-    throw new OcflError(
-      "no operations given; a version must be described by at least one " +
-        "add, remove, or rename",
-    );
-  }
+  if (items.length === 0) throw new OcflError(NO_OPS);
 
   return items.map(parseOp);
 }
+
+/**
+ * Terse constructors for the three operations.
+ *
+ * Building operations programmatically is the point of the structured form, so
+ * these belong beside the schema rather than in the test harness: a caller that
+ * had to import the harness to reach them would pull its fixtures and storage
+ * backends along too. Return types are checked against
+ * {@linkcode OpObjectSchema}'s inferred type, so they cannot drift from it.
+ */
+export const addOp = (source: string, logicalPath: string): VersionOp => ({
+  op: "add",
+  source,
+  logicalPath,
+});
+
+/** A `remove` operation. */
+export const removeOp = (logicalPath: string): VersionOp => ({
+  op: "remove",
+  logicalPath,
+});
+
+/** A `rename` operation. */
+export const renameOp = (from: string, to: string): VersionOp => ({
+  op: "rename",
+  from,
+  to,
+});
 
 /** Source paths every `add` in the list refers to, in order, deduplicated. */
 export function addSources(ops: VersionOp[]): string[] {
