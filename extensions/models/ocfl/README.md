@@ -163,7 +163,13 @@ rather than a second transfer.
 
 **Deduplicated content is fetched once.** Two logical paths sharing a digest
 share one content file, so the bytes are read from storage once and the
-duplicate becomes a local copy — reported as `copied`.
+duplicate becomes a local copy — reported as `copied`. A copy is not a cheaper
+kind of write: it goes through the same temp-and-rename and the same digest
+check as the fetch it duplicates, and is skipped on a re-run on the same terms.
+
+**A version whose state is empty exports zero files**, rather than failing.
+Removing every file leaves a legitimate OCFL version, and staging it means
+writing nothing.
 
 There is **no rollback**. Unlike a half-written OCFL version, a partly populated
 staging directory is not invalid, and `dest` may hold files this run did not put
@@ -276,7 +282,9 @@ Instance names become storage paths, so ids are sanitized. Sanitization is
 lossy, so a digest suffix keeps the mapping injective. For `export` that suffix
 covers the destination as well as the id: re-exporting to the same directory
 updates one manifest in place, while staging the same object in two directories
-yields two resources rather than one silently replacing the other.
+yields two resources rather than one silently replacing the other. The
+destination is normalized first, so `/work/staging` and `/work/staging/` are one
+directory and one resource, not two.
 
 An `export` resource is what makes staged content addressable from a workflow —
 a downstream step reads `destPath` out of `files` rather than reconstructing it:

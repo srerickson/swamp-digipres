@@ -224,25 +224,40 @@ export function validatePaths(paths: Iterable<string>, kind: string): void {
     }
   }
 
-  // E101: no path may be a prefix of another, or a file and a directory would
-  // have to occupy the same name.
-  const sorted = [...all].sort();
-  for (let index = 1; index < sorted.length; index += 1) {
-    const previous = sorted[index - 1];
-    const current = sorted[index];
-    if (current === previous) {
+  // E101: no path may be a directory prefix of another, or a file and a
+  // directory would have to occupy the same name.
+  //
+  // Every ancestor of every path is checked against the whole set, not just
+  // against sort-adjacent neighbours: a third path can sort between a file and
+  // its directory-form sibling and hide the conflict. "a", "a!b", "a/x" sorts
+  // in that order, because '!' precedes '/', so "a" and "a/x" are never
+  // neighbours.
+  const seen = new Set<string>();
+  for (const path of all) {
+    if (seen.has(path)) {
       throw new OcflError(
-        `${kind} path ${JSON.stringify(current)} appears more than once`,
+        `${kind} path ${JSON.stringify(path)} appears more than once`,
         { code: "E101" },
       );
     }
-    if (current.startsWith(`${previous}/`)) {
-      throw new OcflError(
-        `${kind} path ${JSON.stringify(previous)} is a prefix of ` +
-          `${JSON.stringify(current)}; one cannot be both a file and a ` +
-          `directory`,
-        { code: "E101" },
-      );
+    seen.add(path);
+  }
+
+  for (const path of all) {
+    for (
+      let slash = path.indexOf("/");
+      slash !== -1;
+      slash = path.indexOf("/", slash + 1)
+    ) {
+      const ancestor = path.slice(0, slash);
+      if (seen.has(ancestor)) {
+        throw new OcflError(
+          `${kind} path ${JSON.stringify(ancestor)} is a prefix of ` +
+            `${JSON.stringify(path)}; one cannot be both a file and a ` +
+            `directory`,
+          { code: "E101" },
+        );
+      }
     }
   }
 }

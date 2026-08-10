@@ -110,7 +110,10 @@ export async function listObjects(root: StorageRoot): Promise<OcflObject[]> {
  *
  * Every digest in a version's state must appear in the manifest (E050); a
  * state entry that does not resolve means the object cannot be reconstructed,
- * so it is an error rather than an omission.
+ * so it is an error rather than an omission. A digest mapped to an *empty* list
+ * of content paths is the same failure wearing a different hat — the schema
+ * permits it, and it names no bytes either — so it is reported the same way
+ * rather than left for a reader to trip over.
  *
  * @param version Version name; defaults to the object's head.
  */
@@ -131,10 +134,10 @@ export function resolveState(
   const files: ResolvedFile[] = [];
   for (const [digest, logicalPaths] of Object.entries(block.state)) {
     const contentPaths = manifestLookup(inventory, digest);
-    if (contentPaths === undefined) {
+    if (contentPaths === undefined || contentPaths.length === 0) {
       throw new OcflError(
         `version ${name} of ${inventory.id} references digest ${digest}, ` +
-          `which is absent from the manifest`,
+          `which names no content path in the manifest`,
         { code: "E050" },
       );
     }
