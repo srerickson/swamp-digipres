@@ -141,9 +141,27 @@ swamp model method run my-repo export \
 
 One rule for both cases, and because `dest` is a base rather than a filename,
 two logical paths can never contend for the same destination — there is no
-collision rule to think about. `only` takes one exact logical path; naming one
-the version does not hold is an error rather than a silent zero-file success.
-`version` selects a non-head version and defaults to head.
+collision rule to think about. `version` selects a non-head version and defaults
+to head.
+
+**`only` takes exact logical paths — one, or a list.** A string is always one
+path and is never split, so a list arrives as an array:
+
+```bash
+--arg only=images/001.jpg                     # one path
+--input 'only:json=["a.txt","docs/b.txt"]'    # several
+--input-file export.yaml                      # YAML list under `only:`
+```
+
+Selecting several paths in one call is one export: one plan, one download pool,
+one `export` resource. Any path the version does not hold is an error rather
+than a silent zero-file success, and the error names _all_ of them, so a typo'd
+list costs one failed run rather than one per bad path. A path listed twice is
+one file, not two. An empty list is rejected — a computed selection that came
+back empty is a caller's bug, and omitting `only` is how you ask for everything.
+Selection changes nothing else: the files placed are ordered by logical path,
+not by the order they were requested in, and deduplication still fetches shared
+bytes once.
 
 Files are downloaded `concurrency` at a time (4 by default), which is what makes
 an object of many small files bearable on S3, where the round trip dominates.

@@ -124,15 +124,21 @@ export type ExportOptions = {
   dest: string;
   /** Version to export; defaults to the object's head. */
   version?: string;
-  /** Export this one logical path instead of the whole state. */
-  only?: string;
+  /**
+   * Export only these exact logical paths instead of the whole state.
+   *
+   * A bare string is one path, not a list to be split. Each selected path
+   * still lands at its full logical path under {@linkcode dest}.
+   */
+  only?: string | string[];
 };
 
 /**
  * Decide everything about an export without writing anything.
  *
- * @throws {OcflError} when the object, version, or logical path does not exist,
- *   when the inventory holds a path that is unsafe to reconstruct, or when the
+ * @throws {OcflError} when the object or version does not exist, when `only`
+ *   names paths the version does not hold or selects nothing at all, when the
+ *   inventory holds a path that is unsafe to reconstruct, or when the
  *   destination exists as something other than a directory.
  */
 export async function planExport(
@@ -158,18 +164,41 @@ export async function planExport(
   // outside the destination or over its own siblings.
   validatePaths(state.map((file) => file.logicalPath), "logical");
 
-  // An empty selection is only an error when `only` asked for something that
-  // is not there. A version whose state is empty — every file removed — is a
-  // legitimate OCFL version, and exporting it means writing no files.
-  const selected = options.only === undefined
-    ? state
-    : state.filter((file) => file.logicalPath === options.only);
-  if (options.only !== undefined && selected.length === 0) {
+  // A set, so a path asked for twice yields one file rather than two entries
+  // contending for one destination. That is not the duplicate `validatePaths`
+  // rejects: these are matched against state paths, not written as they stand.
+  const wanted = options.only === undefined
+    ? undefined
+    : new Set(Array.isArray(options.only) ? options.only : [options.only]);
+  if (wanted?.size === 0) {
     throw new OcflError(
-      `${options.id} has no logical path ${JSON.stringify(options.only)} in ` +
-        `${version}; that version holds ${state.length} file(s)`,
-      { path: object.path },
+      "only was given an empty selection; omit it to export the whole " +
+        "version state",
     );
+  }
+
+  // Filtering the state rather than iterating the request keeps plan order and
+  // digest deduplication identical to a whole-version export.
+  //
+  // A selection of zero files is only an error when `only` asked for something
+  // that is not there. A version whose state is empty — every file removed —
+  // is a legitimate OCFL version, and exporting it means writing no files.
+  const selected = wanted === undefined
+    ? state
+    : state.filter((file) => wanted.has(file.logicalPath));
+  if (wanted !== undefined) {
+    const held = new Set(state.map((file) => file.logicalPath));
+    const missing = [...wanted].filter((path) => !held.has(path));
+    if (missing.length > 0) {
+      // Every one of them, not just the first: a caller fixing a typo'd list
+      // should need one failed run rather than one per bad path.
+      throw new OcflError(
+        `${options.id} has no logical path(s) ${
+          missing.map((path) => JSON.stringify(path)).join(", ")
+        } in ${version}; that version holds ${state.length} file(s)`,
+        { path: object.path },
+      );
+    }
   }
 
   await requireDirectoryOrAbsent(dest);
