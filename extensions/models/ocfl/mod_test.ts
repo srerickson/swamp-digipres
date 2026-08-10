@@ -658,6 +658,18 @@ Deno.test("create_version rejects an op with an unknown key", () => {
   );
 });
 
+Deno.test("create_version rejects an empty op list at the schema", () => {
+  // A step that computed its way to zero operations must fail here, before the
+  // method opens storage and reads an inventory to discover the same thing.
+  assertThrows(() =>
+    model.methods.create_version.arguments.parse({
+      id: "urn:example:empty",
+      ops: [],
+      ...AGENT,
+    })
+  );
+});
+
 Deno.test("createStorage rejects a local root without a path", () => {
   let threw = false;
   try {

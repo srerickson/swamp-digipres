@@ -11,6 +11,7 @@ import {
   applyOps,
   type LogicalState,
   type OpsInput,
+  OpsInputSchema,
   parseOps,
   validatePaths,
 } from "./ops.ts";
@@ -19,9 +20,10 @@ import {
  * Feed `parseOps` something the type system would refuse.
  *
  * Every one of these arrives over the wire as JSON or YAML, so the runtime
- * check is the only thing standing between it and the planner.
+ * check is the only thing standing between it and the planner. No cast is
+ * needed: `parseOps` takes `unknown`, which is the whole point of it.
  */
-const malformed = (value: unknown) => () => parseOps(value as OpsInput);
+const malformed = (value: unknown) => () => parseOps(value);
 
 /** Digest stand-in: the source path spelled backwards, so it is distinctive. */
 const fakeDigest = (source: string) => [...source].reverse().join("");
@@ -105,6 +107,28 @@ Deno.test("parseOps rejects empty operands and empty lists", () => {
     "invalid operation",
   );
   assertThrows(() => parseOps([]), OcflError, "no operations given");
+});
+
+Deno.test("parseOps reports a value JSON cannot render", () => {
+  // The error formatter runs on whatever arrived. A circular structure or a
+  // BigInt makes JSON.stringify throw, and a formatter that throws would hand
+  // the caller a TypeError in place of the OcflError it is catching.
+  const circular: Record<string, unknown> = { op: "add" };
+  circular.self = circular;
+
+  for (const value of [circular, { op: "add", source: 1n }]) {
+    const error = assertThrows(malformed([value]), OcflError);
+    assert(error.message.includes("invalid operation"));
+  }
+});
+
+Deno.test("OpsInputSchema rejects an empty list at the argument boundary", () => {
+  // An empty list must fail while arguments are being checked, not after the
+  // method has opened storage and read an inventory.
+  assert(!OpsInputSchema.safeParse([]).success);
+  assert(
+    OpsInputSchema.safeParse([{ op: "remove", logicalPath: "a.txt" }]).success,
+  );
 });
 
 Deno.test("parseOps rejects anything that is not an operation object", () => {

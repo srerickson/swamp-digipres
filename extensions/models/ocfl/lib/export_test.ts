@@ -15,18 +15,12 @@ import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import { planExport, runExport } from "./export.ts";
 import { findObject } from "./object.ts";
-import type { VersionOp } from "./ops.ts";
+import { addOp, removeOp, type VersionOp } from "./ops.ts";
 import { openStorageRoot, type StorageRoot } from "./root.ts";
 import { LocalStorage } from "./storage/local.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
-import {
-  addOp,
-  commit as commitTo,
-  forEachBackend,
-  type Harness,
-  removeOp,
-} from "./testing.ts";
+import { commit as commitTo, forEachBackend, type Harness } from "./testing.ts";
 
 const ID = "urn:example:export-1";
 

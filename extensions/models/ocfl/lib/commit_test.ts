@@ -15,18 +15,15 @@ import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import { readInventory, sidecarName } from "./inventory.ts";
 import { openObjectAt, resolveState } from "./object.ts";
-import { parseOps, type VersionOp } from "./ops.ts";
+import { addOp, parseOps, removeOp, renameOp, type VersionOp } from "./ops.ts";
 import type { StorageRoot } from "./root.ts";
 import { MemoryStorage } from "./storage/memory.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
 import {
-  addOp,
   commit as commitTo,
   forEachBackend,
   harness,
-  removeOp,
-  renameOp,
   USER,
 } from "./testing.ts";
 
