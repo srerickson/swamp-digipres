@@ -39,7 +39,11 @@ function commit(
 async function exportTo(
   root: StorageRoot,
   dest: string,
-  options: { version?: string; only?: string; concurrency?: number } = {},
+  options: {
+    version?: string;
+    only?: string | string[];
+    concurrency?: number;
+  } = {},
 ) {
   const plan = await planExport(root, {
     id: ID,
@@ -156,6 +160,74 @@ forEachBackend(
 );
 
 forEachBackend(
+  "only exports several logical paths, in state order",
+  async ({ root, source, scratch }) => {
+    await commit(root, [
+      `add:${await source("a.txt", "alpha")}:a.txt`,
+      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
+      `add:${await source("c.txt", "charlie")}:docs/deep/c.txt`,
+    ]);
+
+    const dest = await scratch();
+    // Requested back to front: the plan follows the version state, not the
+    // order the caller happened to list its paths in.
+    const files = await exportTo(root, dest, {
+      only: ["docs/deep/c.txt", "a.txt"],
+    });
+
+    assertEquals(files.map((file) => file.logicalPath), [
+      "a.txt",
+      "docs/deep/c.txt",
+    ]);
+    assertEquals(await tree(dest), ["a.txt", "docs/deep/c.txt"]);
+    assertEquals(await Deno.readTextFile(`${dest}/docs/deep/c.txt`), "charlie");
+  },
+);
+
+forEachBackend(
+  "a path asked for twice is exported once",
+  async ({ root, source, scratch }) => {
+    await commit(root, [
+      `add:${await source("a.txt", "alpha")}:a.txt`,
+      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
+    ]);
+
+    const dest = await scratch();
+    const files = await exportTo(root, dest, { only: ["a.txt", "a.txt"] });
+
+    assertEquals(files.map((file) => file.logicalPath), ["a.txt"]);
+    assertEquals(await tree(dest), ["a.txt"]);
+  },
+);
+
+forEachBackend(
+  "deduplication still holds within a selection",
+  async (harness) => {
+    const { root, source, scratch } = harness;
+    const identical = "identical bytes";
+    await commit(root, [
+      `add:${await source("one.txt", identical)}:one.txt`,
+      `add:${await source("two.txt", identical)}:copies/two.txt`,
+      `add:${await source("three.txt", "other")}:three.txt`,
+    ]);
+
+    const dest = await scratch();
+    const { storage, root: counted } = await countingRoot(harness);
+    const plan = await planExport(counted, {
+      id: ID,
+      dest,
+      only: ["one.txt", "copies/two.txt"],
+    });
+    const files = await runExport(counted, plan);
+
+    // Selecting a subset must not turn a copy back into a second fetch.
+    assertEquals(storage.readStreams(), 1);
+    assertEquals(files.map((file) => file.source), ["fetched", "copied"]);
+    assertEquals(await tree(dest), ["copies/two.txt", "one.txt"]);
+  },
+);
+
+forEachBackend(
   "only naming a path the version does not hold is an error",
   async ({ root, source, scratch }) => {
     await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
@@ -168,6 +240,40 @@ forEachBackend(
     assert(error.message.includes("docs/nope.txt"));
     assert(error.message.includes("1 file(s)"));
     // Silently succeeding with zero files is the failure mode this prevents.
+    assertEquals(await tree(dest), []);
+  },
+);
+
+forEachBackend(
+  "the error names every missing path, not just the first",
+  async ({ root, source, scratch }) => {
+    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    const dest = await scratch();
+
+    const error = await assertRejects(
+      () =>
+        exportTo(root, dest, {
+          only: ["docs/nope.txt", "a.txt", "gone.jpg"],
+        }),
+      OcflError,
+    );
+    // One failed run per bad list, rather than one per bad path in it.
+    assert(error.message.includes("docs/nope.txt"));
+    assert(error.message.includes("gone.jpg"));
+    assert(!error.message.includes("a.txt"));
+    assertEquals(await tree(dest), []);
+  },
+);
+
+forEachBackend(
+  "an empty selection is rejected rather than read as the whole state",
+  async ({ root, source, scratch }) => {
+    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    const dest = await scratch();
+
+    // A computed list that came back empty is a caller's bug, not a request to
+    // export everything — and not a request to export nothing either.
+    await assertRejects(() => exportTo(root, dest, { only: [] }), OcflError);
     assertEquals(await tree(dest), []);
   },
 );

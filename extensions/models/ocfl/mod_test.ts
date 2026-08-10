@@ -357,6 +357,33 @@ Deno.test("export defaults concurrency rather than requiring it", () => {
   assertEquals(parsed.version, undefined);
 });
 
+Deno.test("export takes only as one path or as a list, unnormalized", () => {
+  const parse = (only: unknown) =>
+    model.methods.export.arguments.parse({
+      id: SPEC_ID,
+      dest: "/tmp/staging",
+      only,
+    }).only;
+
+  // Normalizing is `lib/`'s job, so the schema keeps both shapes visible to
+  // anyone reading the generated argument documentation.
+  assertEquals(parse("spec.md"), "spec.md");
+  assertEquals(parse(["spec.md", "docs/b.txt"]), ["spec.md", "docs/b.txt"]);
+});
+
+Deno.test("export accepts a list of logical paths end to end", async () => {
+  const run = await exportFixture({ only: ["spec.md"] });
+  try {
+    await run.run();
+    const data = ExportSchema.parse(run.writes[0].data);
+    assertEquals(data.fileCount, 1);
+    assertEquals(data.files[0].logicalPath, "spec.md");
+    assertEquals(data.files[0].destPath, `${run.dest}/spec.md`);
+  } finally {
+    await run.cleanup();
+  }
+});
+
 Deno.test("exportInstanceName distinguishes destinations", () => {
   const name = exportInstanceName(SPEC_ID, "/tmp/a");
   assertEquals(name, exportInstanceName(SPEC_ID, "/tmp/a"));

@@ -317,9 +317,12 @@ const ExportArgsSchema = z.object({
   version: z.string().optional().describe(
     "Version to export; defaults to the object's head",
   ),
-  only: z.string().optional().describe(
-    "Export this one logical path instead of the whole version state. It " +
-      "still lands at its full logical path under 'dest', not at the top.",
+  only: z.union([z.string(), z.array(z.string())]).optional().describe(
+    "Export only these exact logical paths instead of the whole version " +
+      "state. Each still lands at its full logical path under 'dest', not at " +
+      "the top. One path as a plain string — never split — several as " +
+      "only:json=[...] or a YAML list via --input-file. A path the version " +
+      "does not hold is an error.",
   ),
   concurrency: z.number().int().min(1).max(64).default(DEFAULT_CONCURRENCY)
     .describe("Files to download simultaneously"),
@@ -370,7 +373,7 @@ const CreateVersionArgsSchema = z.object({
 /** Model definition for an OCFL storage root. */
 export const model = {
   type: "@crudec/ocfl-repository",
-  version: "2026.08.08.1",
+  version: "2026.08.10.1",
   description:
     "Initialize, index, and resolve content in an OCFL storage root on local disk or S3",
   globalArguments: GlobalArgsSchema,
