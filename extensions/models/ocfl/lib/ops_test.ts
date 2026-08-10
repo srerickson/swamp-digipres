@@ -1,5 +1,5 @@
 /**
- * Tests for the operation language.
+ * Tests for the version operations.
  *
  * Everything here is pure: no storage, no digests, no clock. These are the
  * failures that must be caught before a single byte is written.
@@ -10,10 +10,18 @@ import {
   addSources,
   applyOps,
   type LogicalState,
+  type OpsInput,
   parseOps,
-  splitOp,
   validatePaths,
 } from "./ops.ts";
+
+/**
+ * Feed `parseOps` something the type system would refuse.
+ *
+ * Every one of these arrives over the wire as JSON or YAML, so the runtime
+ * check is the only thing standing between it and the planner.
+ */
+const malformed = (value: unknown) => () => parseOps(value as OpsInput);
 
 /** Digest stand-in: the source path spelled backwards, so it is distinctive. */
 const fakeDigest = (source: string) => [...source].reverse().join("");
@@ -22,84 +30,97 @@ function state(entries: Record<string, string>): LogicalState {
   return new Map(Object.entries(entries));
 }
 
-Deno.test("splitOp splits on unescaped colons", () => {
-  assertEquals(splitOp("add:/data/a.txt:a.txt"), [
-    "add",
-    "/data/a.txt",
-    "a.txt",
-  ]);
-});
-
-Deno.test("splitOp honors escaped colons and backslashes", () => {
-  assertEquals(splitOp("add:/data/odd\\:name:docs/odd\\:name"), [
-    "add",
-    "/data/odd:name",
-    "docs/odd:name",
-  ]);
-  assertEquals(splitOp("remove:a\\\\b"), ["remove", "a\\b"]);
-});
-
-Deno.test("splitOp leaves other backslashes alone", () => {
-  // A backslash that is not an escape must survive, or a path carrying one
-  // would be silently rewritten.
-  assertEquals(splitOp("remove:a\\nb"), ["remove", "a\\nb"]);
-});
-
 Deno.test("parseOps reads each verb", () => {
+  const ops: OpsInput = [
+    { op: "add", source: "/data/a.txt", logicalPath: "a.txt" },
+    { op: "remove", logicalPath: "old.txt" },
+    { op: "rename", from: "b.txt", to: "docs/b.txt" },
+  ];
+  assertEquals(parseOps(ops), ops);
+});
+
+Deno.test("parseOps accepts a bare operation", () => {
+  // The single-operation case is common enough that requiring a one-element
+  // list would be noise.
   assertEquals(
-    parseOps([
-      "add:/data/a.txt:a.txt",
-      "remove:old.txt",
-      "rename:b.txt:docs/b.txt",
-    ]),
-    [
-      { op: "add", source: "/data/a.txt", logicalPath: "a.txt" },
-      { op: "remove", logicalPath: "old.txt" },
-      { op: "rename", from: "b.txt", to: "docs/b.txt" },
-    ],
+    parseOps({ op: "remove", logicalPath: "old.txt" }),
+    [{ op: "remove", logicalPath: "old.txt" }],
   );
 });
 
-Deno.test("parseOps accepts one newline-delimited string", () => {
-  // swamp's --input does not accumulate repeated keys, so this is a first-class
-  // way to pass a list rather than a convenience.
+Deno.test("parseOps needs no escaping for a path holding a delimiter", () => {
+  // The whole point of the structured form. Under the old colon-delimited
+  // syntax this path required '\:' escaping, and getting it wrong deposited
+  // content somewhere other than where it was asked to go.
   assertEquals(
-    parseOps("add:/data/a.txt:a.txt\n\n  remove:old.txt  \n"),
-    [
-      { op: "add", source: "/data/a.txt", logicalPath: "a.txt" },
-      { op: "remove", logicalPath: "old.txt" },
-    ],
+    parseOps([{
+      op: "add",
+      source: "/data/odd:name",
+      logicalPath: "docs/odd:name",
+    }]),
+    [{ op: "add", source: "/data/odd:name", logicalPath: "docs/odd:name" }],
   );
 });
 
 Deno.test("parseOps rejects an unknown verb", () => {
-  const error = assertThrows(() => parseOps(["copy:a.txt:b.txt"]), OcflError);
-  assert(error.message.includes("unknown operation"));
-});
-
-Deno.test("parseOps rejects the wrong arity", () => {
-  const tooFew = assertThrows(() => parseOps(["add:/data/a.txt"]), OcflError);
-  assert(tooFew.message.includes("2 operand(s) but got 1"));
-  // An unescaped colon in a path shows up as arity, so the message points at
-  // the escape rule.
-  const tooMany = assertThrows(
-    () => parseOps(["add:/data/a:b.txt:a.txt"]),
+  const error = assertThrows(
+    malformed([{ op: "copy", from: "a.txt", to: "b.txt" }]),
     OcflError,
   );
-  assert(tooMany.message.includes("\\:"));
+  assert(error.message.includes("invalid operation"));
+});
+
+Deno.test("parseOps rejects an unknown key", () => {
+  // Silently dropping it is the failure this format exists to prevent: a
+  // misspelled 'logicalPath' would otherwise leave the operand undefined.
+  const error = assertThrows(
+    malformed([{
+      op: "add",
+      source: "/data/a.txt",
+      logicalPath: "a.txt",
+      logicalpath: "a.txt",
+    }]),
+    OcflError,
+  );
+  assert(error.message.includes("invalid operation"));
+});
+
+Deno.test("parseOps rejects a key belonging to another verb", () => {
+  assertThrows(
+    malformed([{ op: "remove", from: "a.txt" }]),
+    OcflError,
+    "invalid operation",
+  );
+  assertThrows(
+    malformed([{ op: "rename", from: "a.txt", logicalPath: "b.txt" }]),
+    OcflError,
+    "invalid operation",
+  );
 });
 
 Deno.test("parseOps rejects empty operands and empty lists", () => {
-  assertThrows(() => parseOps(["remove:"]), OcflError, "empty operand");
+  assertThrows(
+    malformed([{ op: "remove", logicalPath: "" }]),
+    OcflError,
+    "invalid operation",
+  );
   assertThrows(() => parseOps([]), OcflError, "no operations given");
-  assertThrows(() => parseOps("   \n  "), OcflError, "no operations given");
+});
+
+Deno.test("parseOps rejects anything that is not an operation object", () => {
+  // These arrive as JSON or YAML, so the runtime check is the only guard. The
+  // old delimited string is included deliberately: it must fail loudly rather
+  // than be misread.
+  for (const value of [42, null, "add:/data/a.txt:a.txt", ["a"]]) {
+    assertThrows(malformed([value]), OcflError, "invalid operation");
+  }
 });
 
 Deno.test("addSources deduplicates and preserves order", () => {
   const ops = parseOps([
-    "add:/data/a.txt:a.txt",
-    "add:/data/b.txt:b.txt",
-    "add:/data/a.txt:copy-of-a.txt",
+    { op: "add", source: "/data/a.txt", logicalPath: "a.txt" },
+    { op: "add", source: "/data/b.txt", logicalPath: "b.txt" },
+    { op: "add", source: "/data/a.txt", logicalPath: "copy-of-a.txt" },
   ]);
   assertEquals(addSources(ops), ["/data/a.txt", "/data/b.txt"]);
 });
@@ -108,9 +129,9 @@ Deno.test("applyOps folds operations in order", () => {
   const result = applyOps(
     state({ "a.txt": "digest-a", "b.txt": "digest-b" }),
     parseOps([
-      "rename:a.txt:archive/a.txt",
-      "add:/data/new:a.txt",
-      "remove:b.txt",
+      { op: "rename", from: "a.txt", to: "archive/a.txt" },
+      { op: "add", source: "/data/new", logicalPath: "a.txt" },
+      { op: "remove", logicalPath: "b.txt" },
     ]),
     fakeDigest,
   );
@@ -122,14 +143,18 @@ Deno.test("applyOps folds operations in order", () => {
 
 Deno.test("applyOps leaves the base state untouched", () => {
   const base = state({ "a.txt": "digest-a" });
-  applyOps(base, parseOps(["remove:a.txt"]), fakeDigest);
+  applyOps(
+    base,
+    parseOps([{ op: "remove", logicalPath: "a.txt" }]),
+    fakeDigest,
+  );
   assertEquals(base.size, 1);
 });
 
 Deno.test("applyOps treats add onto an existing path as a supersede", () => {
   const result = applyOps(
     state({ "a.txt": "old" }),
-    parseOps(["add:/data/new:a.txt"]),
+    parseOps([{ op: "add", source: "/data/new", logicalPath: "a.txt" }]),
     fakeDigest,
   );
   assertEquals(result.get("a.txt"), fakeDigest("/data/new"));
@@ -137,12 +162,22 @@ Deno.test("applyOps treats add onto an existing path as a supersede", () => {
 
 Deno.test("applyOps rejects removing or renaming an absent path", () => {
   assertThrows(
-    () => applyOps(state({}), parseOps(["remove:gone.txt"]), fakeDigest),
+    () =>
+      applyOps(
+        state({}),
+        parseOps([{ op: "remove", logicalPath: "gone.txt" }]),
+        fakeDigest,
+      ),
     OcflError,
     "cannot remove",
   );
   assertThrows(
-    () => applyOps(state({}), parseOps(["rename:a.txt:b.txt"]), fakeDigest),
+    () =>
+      applyOps(
+        state({}),
+        parseOps([{ op: "rename", from: "a.txt", to: "b.txt" }]),
+        fakeDigest,
+      ),
     OcflError,
     "cannot rename",
   );
@@ -153,7 +188,7 @@ Deno.test("applyOps rejects renaming onto an occupied path", () => {
     () =>
       applyOps(
         state({ "a.txt": "digest-a", "b.txt": "digest-b" }),
-        parseOps(["rename:a.txt:b.txt"]),
+        parseOps([{ op: "rename", from: "a.txt", to: "b.txt" }]),
         fakeDigest,
       ),
     OcflError,
@@ -166,7 +201,10 @@ Deno.test("applyOps allows a rename into a path freed earlier in the list", () =
   // strictly in sequence.
   const result = applyOps(
     state({ "a.txt": "digest-a", "b.txt": "digest-b" }),
-    parseOps(["remove:b.txt", "rename:a.txt:b.txt"]),
+    parseOps([
+      { op: "remove", logicalPath: "b.txt" },
+      { op: "rename", from: "a.txt", to: "b.txt" },
+    ]),
     fakeDigest,
   );
   assertEquals([...result], [["b.txt", "digest-a"]]);

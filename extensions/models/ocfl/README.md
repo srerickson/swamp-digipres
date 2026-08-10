@@ -201,32 +201,46 @@ Creating an object and updating one are the same operation in OCFL: both mean
 committing a new version. The caller does not supply a file listing — it
 supplies edits against the previous version's logical state, applied in order.
 
-```bash
-swamp model method run my-repo create_version \
-  --input id=urn:example:object-1 \
-  --input version=1 \
-  --input 'ops:json=["add:/ingest/spec.md:docs/spec.md"]' \
-  --input userName="Seth Erickson" \
-  --input userAddress=mailto:seth@crude.computer \
-  --input message="initial deposit"
+Operations are objects, not strings. `--input key=value` does not accumulate
+repeated keys, so a list arrives either in a YAML file or as JSON. The file form
+is usually the one you want:
+
+```yaml
+# ingest.yaml
+id: urn:example:object-1
+version: 1
+userName: Seth Erickson
+userAddress: mailto:seth@crude.computer
+message: initial deposit
+ops:
+  - op: add
+    source: /ingest/spec.md
+    logicalPath: docs/spec.md
 ```
 
-| Operation                    | Effect                                                      |
-| ---------------------------- | ----------------------------------------------------------- |
-| `add:<source>:<logicalPath>` | Copy a local file in at that logical path, superseding any  |
-| `remove:<logicalPath>`       | Drop the path from the new state; content stays recoverable |
-| `rename:<from>:<to>`         | Move a logical path; writes no content at all               |
+```bash
+swamp model method run my-repo create_version --input-file ingest.yaml
+```
 
-Sources are absolute local paths. Escape a literal colon as `\:`.
+| Operation                        | Effect                                                      |
+| -------------------------------- | ----------------------------------------------------------- |
+| `{op: add, source, logicalPath}` | Copy a local file in at that logical path, superseding any  |
+| `{op: remove, logicalPath}`      | Drop the path from the new state; content stays recoverable |
+| `{op: rename, from, to}`         | Move a logical path; writes no content at all               |
 
-`--input key=value` does not accumulate repeated keys, so a list of operations
-arrives one of three ways — all parse identically:
+Sources are absolute local paths. Unknown keys are rejected rather than ignored:
+a misspelled `logicalPath` would otherwise leave the operand undefined and
+deposit content somewhere other than where it was asked to go.
+
+The same list as JSON, and the single-operation shorthand:
 
 ```bash
---input 'ops:json=["add:/a.txt:a.txt","remove:b.txt"]'   # JSON array
---input ops=$'add:/a.txt:a.txt\nremove:b.txt'            # newline-delimited
---input-file ingest.yaml                                  # YAML list under `ops:`
+--input 'ops:json=[{"op":"add","source":"/a.txt","logicalPath":"a.txt"},{"op":"remove","logicalPath":"b.txt"}]'
+--input 'ops:json={"op":"remove","logicalPath":"b.txt"}'   # one op, no list
 ```
+
+Building these from a workflow needs no string assembly and no escaping, which
+is the point — a logical path containing a colon is just a string here.
 
 **`version` is an assertion, not an instruction.** It is the unpadded number the
 call expects to produce — `1` for a new object, `head+1` otherwise — checked

@@ -27,7 +27,7 @@ import {
   runExport,
 } from "./lib/export.ts";
 import { contentDirectoryOf, versionNames } from "./lib/inventory.ts";
-import { parseOps } from "./lib/ops.ts";
+import { OpsInputSchema, parseOps } from "./lib/ops.ts";
 import {
   FLAT_DIRECT,
   HASHED_N_TUPLE,
@@ -332,12 +332,13 @@ const CreateVersionArgsSchema = z.object({
   id: z.string().min(1).describe(
     "Object id. Created if it does not exist yet, otherwise extended.",
   ),
-  ops: z.union([z.array(z.string()), z.string()]).describe(
-    "Operations building the new version's state, applied in order: " +
-      "'add:<source>:<logicalPath>', 'remove:<logicalPath>', " +
-      "'rename:<from>:<to>'. Sources are absolute local paths. Escape a " +
-      "literal colon as '\\:'. Pass as ops:json=[...], a YAML list via " +
-      "--input-file, or one newline-delimited string.",
+  ops: OpsInputSchema.describe(
+    "Operations building the new version's state, applied in order. Each is " +
+      "an object: {op: add, source, logicalPath} copies a local file in at " +
+      "that logical path, {op: remove, logicalPath} drops a path, and " +
+      "{op: rename, from, to} moves one. Sources are absolute local paths. " +
+      "Pass one operation on its own, or a list as ops:json=[...] or a YAML " +
+      "list via --input-file.",
   ),
   version: z.number().int().positive().optional().describe(
     "Version number this call expects to create, unpadded (1 for a new " +
@@ -373,7 +374,7 @@ const CreateVersionArgsSchema = z.object({
 /** Model definition for an OCFL storage root. */
 export const model = {
   type: "@crudec/ocfl-repository",
-  version: "2026.08.10.1",
+  version: "2026.08.10.2",
   description:
     "Initialize, index, and resolve content in an OCFL storage root on local disk or S3",
   globalArguments: GlobalArgsSchema,

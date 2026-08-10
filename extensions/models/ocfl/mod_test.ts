@@ -442,7 +442,11 @@ Deno.test("create_version writes one object resource for a new object", async ()
     await model.methods.create_version.execute(
       args(model.methods.create_version.arguments, {
         id: "urn:example:new-1",
-        ops: [`add:${await repo.source("a.txt", "alpha")}:docs/a.txt`],
+        ops: [{
+          op: "add",
+          source: await repo.source("a.txt", "alpha"),
+          logicalPath: "docs/a.txt",
+        }],
         version: 1,
         message: "initial deposit",
         ...AGENT,
@@ -479,7 +483,11 @@ Deno.test("MECHANICAL: create_version output matches ObjectSchema exactly", asyn
     await model.methods.create_version.execute(
       args(model.methods.create_version.arguments, {
         id: "urn:example:shape",
-        ops: [`add:${await repo.source("a.txt", "alpha")}:a.txt`],
+        ops: [{
+          op: "add",
+          source: await repo.source("a.txt", "alpha"),
+          logicalPath: "a.txt",
+        }],
         ...AGENT,
       }),
       context,
@@ -503,7 +511,11 @@ Deno.test("create_version updates an existing object and reports the new head", 
     });
     const create = args(model.methods.create_version.arguments, {
       id: "urn:example:obj-2",
-      ops: [`add:${await repo.source("a.txt", "alpha")}:a.txt`],
+      ops: [{
+        op: "add",
+        source: await repo.source("a.txt", "alpha"),
+        logicalPath: "a.txt",
+      }],
       ...AGENT,
     });
     await model.methods.create_version.execute(create, context);
@@ -511,7 +523,11 @@ Deno.test("create_version updates an existing object and reports the new head", 
     await model.methods.create_version.execute(
       args(model.methods.create_version.arguments, {
         id: "urn:example:obj-2",
-        ops: [`add:${await repo.source("b.txt", "bravo")}:b.txt`],
+        ops: [{
+          op: "add",
+          source: await repo.source("b.txt", "bravo"),
+          logicalPath: "b.txt",
+        }],
         version: 2,
         ...AGENT,
       }),
@@ -544,7 +560,11 @@ Deno.test("create_version dry run writes no resource and no storage", async () =
     await model.methods.create_version.execute(
       args(model.methods.create_version.arguments, {
         id: "urn:example:dry",
-        ops: [`add:${await repo.source("a.txt", "alpha")}:a.txt`],
+        ops: [{
+          op: "add",
+          source: await repo.source("a.txt", "alpha"),
+          logicalPath: "a.txt",
+        }],
         dryRun: true,
         ...AGENT,
       }),
@@ -573,7 +593,11 @@ Deno.test("create_version writes no resource when the commit fails", async () =>
       model.methods.create_version.execute(
         args(model.methods.create_version.arguments, {
           id: "urn:example:missing-source",
-          ops: ["add:/nonexistent/nope.txt:a.txt"],
+          ops: [{
+            op: "add",
+            source: "/nonexistent/nope.txt",
+            logicalPath: "a.txt",
+          }],
           ...AGENT,
         }),
         context,
@@ -591,20 +615,47 @@ Deno.test("create_version requires a user for provenance", () => {
   assertThrows(() =>
     model.methods.create_version.arguments.parse({
       id: "urn:example:anon",
-      ops: ["add:/tmp/a.txt:a.txt"],
+      ops: [{ op: "add", source: "/tmp/a.txt", logicalPath: "a.txt" }],
     })
   );
 });
 
-Deno.test("create_version accepts ops as one newline-delimited string", () => {
+Deno.test("create_version accepts a bare op object", () => {
+  // The single-operation case, which is what a per-object workflow step emits.
   const parsed = model.methods.create_version.arguments.parse({
-    id: "urn:example:multiline",
-    ops: "add:/tmp/a.txt:a.txt\nremove:b.txt",
+    id: "urn:example:one-op",
+    ops: { op: "remove", logicalPath: "b.txt" },
     ...AGENT,
   });
-  assertEquals(parsed.ops, "add:/tmp/a.txt:a.txt\nremove:b.txt");
+  assertEquals(parsed.ops, { op: "remove", logicalPath: "b.txt" });
   assertEquals(parsed.dryRun, false);
   assertEquals(parsed.allowNoChange, false);
+});
+
+Deno.test("create_version rejects the old delimited string form", () => {
+  // Pinned deliberately. A colon-delimited op must fail at the schema rather
+  // than be coerced into something that commits content somewhere unintended.
+  for (const ops of ["add:/tmp/a.txt:a.txt", ["add:/tmp/a.txt:a.txt"]]) {
+    assertThrows(() =>
+      model.methods.create_version.arguments.parse({
+        id: "urn:example:legacy",
+        ops,
+        ...AGENT,
+      })
+    );
+  }
+});
+
+Deno.test("create_version rejects an op with an unknown key", () => {
+  // A misspelled 'logicalPath' silently dropped is the failure the structured
+  // form exists to prevent, so the schema must refuse it here too.
+  assertThrows(() =>
+    model.methods.create_version.arguments.parse({
+      id: "urn:example:typo",
+      ops: [{ op: "add", source: "/tmp/a.txt", logicalpath: "a.txt" }],
+      ...AGENT,
+    })
+  );
 });
 
 Deno.test("createStorage rejects a local root without a path", () => {

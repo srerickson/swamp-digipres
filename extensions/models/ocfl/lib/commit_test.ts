@@ -15,15 +15,18 @@ import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import { readInventory, sidecarName } from "./inventory.ts";
 import { openObjectAt, resolveState } from "./object.ts";
-import { parseOps } from "./ops.ts";
+import { parseOps, type VersionOp } from "./ops.ts";
 import type { StorageRoot } from "./root.ts";
 import { MemoryStorage } from "./storage/memory.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
 import {
+  addOp,
   commit as commitTo,
   forEachBackend,
   harness,
+  removeOp,
+  renameOp,
   USER,
 } from "./testing.ts";
 
@@ -32,7 +35,7 @@ const ID = "urn:example:obj-1";
 /** Plan and commit in one step, against this file's object. */
 function commit(
   root: StorageRoot,
-  ops: string[],
+  ops: VersionOp[],
   options: Record<string, unknown> = {},
 ) {
   return commitTo(root, ID, ops, options);
@@ -40,8 +43,8 @@ function commit(
 
 forEachBackend("creates a new object at v1", async ({ root, source }) => {
   const plan = await commit(root, [
-    `add:${await source("a.txt", "alpha")}:a.txt`,
-    `add:${await source("b.txt", "bravo")}:docs/b.txt`,
+    addOp(await source("a.txt", "alpha"), "a.txt"),
+    addOp(await source("b.txt", "bravo"), "docs/b.txt"),
   ], { message: "initial deposit" });
 
   assertEquals(plan.isNew, true);
@@ -71,7 +74,7 @@ forEachBackend(
   "writes content whose bytes match the manifest digest",
   async ({ root, source }) => {
     const plan = await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
     ]);
     const object = await openObjectAt(root, plan.objectPath);
     for (const [digest, paths] of Object.entries(object.inventory.manifest)) {
@@ -87,7 +90,7 @@ forEachBackend(
   "root inventory is byte-identical to the head version's (E064)",
   async ({ root, source }) => {
     const plan = await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
     ]);
     const storage = root.storage;
     const rootBytes = await storage.read(
@@ -119,12 +122,12 @@ forEachBackend(
   async ({ root, source }) => {
     const stable = await source("stable.txt", "unchanged across versions");
     await commit(root, [
-      `add:${stable}:stable.txt`,
-      `add:${await source("v1.txt", "first")}:changing.txt`,
+      addOp(stable, "stable.txt"),
+      addOp(await source("v1.txt", "first"), "changing.txt"),
     ]);
 
     const plan = await commit(root, [
-      `add:${await source("v2.txt", "second")}:changing.txt`,
+      addOp(await source("v2.txt", "second"), "changing.txt"),
     ]);
     assertEquals(plan.version, "v2");
     // Only the changed file needs bytes; the untouched one is already in the
@@ -149,8 +152,8 @@ forEachBackend(
 );
 
 forEachBackend("rename writes no content at all", async ({ root, source }) => {
-  await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
-  const plan = await commit(root, ["rename:a.txt:archive/a.txt"]);
+  await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
+  const plan = await commit(root, [renameOp("a.txt", "archive/a.txt")]);
 
   assertEquals(plan.content, []);
   const object = await openObjectAt(root, plan.objectPath);
@@ -164,10 +167,10 @@ forEachBackend(
   "remove drops the path but keeps the content recoverable",
   async ({ root, source }) => {
     await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:b.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "b.txt"),
     ]);
-    const plan = await commit(root, ["remove:b.txt"]);
+    const plan = await commit(root, [removeOp("b.txt")]);
 
     assertEquals(plan.content, []);
     const object = await openObjectAt(root, plan.objectPath);
@@ -190,20 +193,20 @@ forEachBackend(
 forEachBackend(
   "carries prior version blocks forward unchanged (E066/W011)",
   async ({ root, source }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`], {
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")], {
       message: "first",
     });
     const first = (await openObjectAt(
       root,
       (await planVersion(root, {
         id: ID,
-        ops: parseOps(["remove:a.txt"]),
+        ops: parseOps([removeOp("a.txt")]),
         ...USER,
       })).objectPath,
     )).inventory.versions["v1"];
 
     const plan = await commit(root, [
-      `add:${await source("b.txt", "bravo")}:b.txt`,
+      addOp(await source("b.txt", "bravo"), "b.txt"),
     ], { message: "second" });
     const after = (await openObjectAt(root, plan.objectPath)).inventory
       .versions["v1"];
@@ -218,8 +221,8 @@ forEachBackend(
   async ({ root, source }) => {
     const same = await source("same.txt", "identical bytes");
     const plan = await commit(root, [
-      `add:${same}:one.txt`,
-      `add:${same}:two.txt`,
+      addOp(same, "one.txt"),
+      addOp(same, "two.txt"),
     ]);
 
     assertEquals(plan.content.length, 1);
@@ -233,7 +236,7 @@ forEachBackend(
 
 forEachBackend("honors a custom contentDirectory", async ({ root, source }) => {
   const plan = await commit(root, [
-    `add:${await source("a.txt", "alpha")}:a.txt`,
+    addOp(await source("a.txt", "alpha"), "a.txt"),
   ], { contentDirectory: "data" });
 
   assertEquals(plan.content[0].contentPath, "v1/data/a.txt");
@@ -247,7 +250,7 @@ forEachBackend("honors a custom contentDirectory", async ({ root, source }) => {
   // Fixed at v1: a later version cannot move it.
   const b = await source("b.txt", "bravo");
   await assertRejects(
-    () => commit(root, [`add:${b}:b.txt`], { contentDirectory: "content" }),
+    () => commit(root, [addOp(b, "b.txt")], { contentDirectory: "content" }),
     OcflError,
     "fixed at v1",
   );
@@ -256,7 +259,7 @@ forEachBackend("honors a custom contentDirectory", async ({ root, source }) => {
 forEachBackend(
   "an existing object's digest algorithm cannot be changed",
   async ({ root, source }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`], {
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")], {
       digestAlgorithm: "sha256",
     });
     const object = await openObjectAt(
@@ -267,7 +270,7 @@ forEachBackend(
 
     const b = await source("b.txt", "bravo");
     await assertRejects(
-      () => commit(root, [`add:${b}:b.txt`], { digestAlgorithm: "sha512" }),
+      () => commit(root, [addOp(b, "b.txt")], { digestAlgorithm: "sha512" }),
       OcflError,
       "cannot be changed",
     );
@@ -283,19 +286,19 @@ forEachBackend(
     // A new object is v1, so any other expectation is a mistake worth catching
     // before anything is written.
     await assertRejects(
-      () => commit(root, [`add:${a}:a.txt`], { version: 3 }),
+      () => commit(root, [addOp(a, "a.txt")], { version: 3 }),
       OcflError,
       "does not exist yet",
     );
 
-    await commit(root, [`add:${a}:a.txt`], { version: 1 });
+    await commit(root, [addOp(a, "a.txt")], { version: 1 });
     await assertRejects(
-      () => commit(root, [`add:${b}:b.txt`], { version: 5 }),
+      () => commit(root, [addOp(b, "b.txt")], { version: 5 }),
       OcflError,
       "its head is v1",
     );
 
-    const plan = await commit(root, [`add:${b}:b.txt`], { version: 2 });
+    const plan = await commit(root, [addOp(b, "b.txt")], { version: 2 });
     assertEquals(plan.version, "v2");
   },
 );
@@ -303,12 +306,14 @@ forEachBackend(
 forEachBackend(
   "a failed version assertion writes nothing",
   async ({ root, source }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const objectPath = root.layout.layout?.resolve(ID) as string;
     const before = await listAll(root.storage, objectPath);
 
     const b = await source("b.txt", "bravo");
-    await assertRejects(() => commit(root, [`add:${b}:b.txt`], { version: 9 }));
+    await assertRejects(() =>
+      commit(root, [addOp(b, "b.txt")], { version: 9 })
+    );
     assertEquals(await listAll(root.storage, objectPath), before);
   },
 );
@@ -317,16 +322,16 @@ forEachBackend(
   "refuses a version that changes nothing",
   async ({ root, source }) => {
     const a = await source("a.txt", "alpha");
-    await commit(root, [`add:${a}:a.txt`]);
+    await commit(root, [addOp(a, "a.txt")]);
 
     await assertRejects(
-      () => commit(root, [`add:${a}:a.txt`]),
+      () => commit(root, [addOp(a, "a.txt")]),
       OcflError,
       "refusing to create a version that changes nothing",
     );
 
     // The escape hatch still works, and produces a real version.
-    const plan = await commit(root, [`add:${a}:a.txt`], {
+    const plan = await commit(root, [addOp(a, "a.txt")], {
       allowNoChange: true,
     });
     assertEquals(plan.version, "v2");
@@ -342,7 +347,7 @@ forEachBackend(
     const path = await source("a.txt", "alpha");
     const plan = await planVersion(root, {
       id: ID,
-      ops: parseOps([`add:${path}:a.txt`]),
+      ops: parseOps([addOp(path, "a.txt")]),
       ...USER,
     });
 
@@ -367,8 +372,8 @@ forEachBackend(
     const plan = await planVersion(root, {
       id: ID,
       ops: parseOps([
-        `add:${await source("a.txt", "alpha")}:a.txt`,
-        `add:${await source("b.txt", "bravo")}:b.txt`,
+        addOp(await source("a.txt", "alpha"), "a.txt"),
+        addOp(await source("b.txt", "bravo"), "b.txt"),
       ]),
       ...USER,
     });
@@ -386,13 +391,13 @@ forEachBackend(
 forEachBackend(
   "a mid-write failure on an update leaves the previous version intact",
   async ({ root, source }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const objectPath = root.layout.layout?.resolve(ID) as string;
     const before = await listAll(root.storage, objectPath);
 
     const plan = await planVersion(root, {
       id: ID,
-      ops: parseOps([`add:${await source("b.txt", "bravo")}:b.txt`]),
+      ops: parseOps([addOp(await source("b.txt", "bravo"), "b.txt")]),
       ...USER,
     });
     const failing = failOn(root.storage, "b.txt");
@@ -410,16 +415,16 @@ forEachBackend(
 forEachBackend(
   "refuses to commit when another writer moved head",
   async ({ root, source }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
 
     // Plan against v1...
     const plan = await planVersion(root, {
       id: ID,
-      ops: parseOps([`add:${await source("b.txt", "bravo")}:b.txt`]),
+      ops: parseOps([addOp(await source("b.txt", "bravo"), "b.txt")]),
       ...USER,
     });
     // ...then let someone else land v2 first.
-    await commit(root, [`add:${await source("c.txt", "charlie")}:c.txt`]);
+    await commit(root, [addOp(await source("c.txt", "charlie"), "c.txt")]);
 
     await assertRejects(
       () => commitVersion(root, plan),
@@ -440,12 +445,12 @@ forEachBackend(
 forEachBackend("rejects an unsafe logical path", async ({ root, source }) => {
   const path = await source("a.txt", "alpha");
   await assertRejects(
-    () => commit(root, [`add:${path}:../escape.txt`]),
+    () => commit(root, [addOp(path, "../escape.txt")]),
     OcflError,
     "E099",
   );
   await assertRejects(
-    () => commit(root, [`add:${path}:docs`, `add:${path}:docs/spec.md`]),
+    () => commit(root, [addOp(path, "docs"), addOp(path, "docs/spec.md")]),
     OcflError,
     "E101",
   );
@@ -453,7 +458,7 @@ forEachBackend("rejects an unsafe logical path", async ({ root, source }) => {
 
 forEachBackend("rejects a missing source file", async ({ root }) => {
   await assertRejects(
-    () => commit(root, ["add:/nonexistent/nope.txt:a.txt"]),
+    () => commit(root, [addOp("/nonexistent/nope.txt", "a.txt")]),
     OcflError,
     "source file not found",
   );
@@ -470,7 +475,7 @@ Deno.test("refuses to write into a root with an uncomputable layout", async () =
     () =>
       planVersion(root, {
         id: ID,
-        ops: parseOps(["add:/tmp/a.txt:a.txt"]),
+        ops: parseOps([addOp("/tmp/a.txt", "a.txt")]),
         ...USER,
       }),
     OcflError,
@@ -490,7 +495,7 @@ Deno.test("refuses to create an object over a non-empty object root", async () =
 
     const plan = await planVersion(root, {
       id: ID,
-      ops: parseOps([`add:${await context.source("a.txt", "alpha")}:a.txt`]),
+      ops: parseOps([addOp(await context.source("a.txt", "alpha"), "a.txt")]),
       ...USER,
     });
     await assertRejects(
