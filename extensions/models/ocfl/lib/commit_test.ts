@@ -17,68 +17,14 @@ import { readInventory, sidecarName } from "./inventory.ts";
 import { HASHED_N_TUPLE } from "./layout.ts";
 import { openObjectAt, resolveState } from "./object.ts";
 import { parseOps } from "./ops.ts";
-import { initStorageRoot, type StorageRoot } from "./root.ts";
-import { LocalStorage } from "./storage/local.ts";
+import type { StorageRoot } from "./root.ts";
 import { MemoryStorage } from "./storage/memory.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
+import { forEachBackend, type Harness, harness } from "./testing.ts";
 
 const ID = "urn:example:obj-1";
 const USER = { userName: "Test Agent", userAddress: "mailto:test@example.com" };
-
-/** A disposable storage root plus a scratch directory to source files from. */
-type Harness = {
-  root: StorageRoot;
-  /** Write a source file and return its absolute path. */
-  source(name: string, contents: string): Promise<string>;
-  cleanup(): Promise<void>;
-};
-
-async function harness(backend: "memory" | "local"): Promise<Harness> {
-  const sourceDir = await Deno.makeTempDir({ prefix: "ocfl-src-" });
-  const dirs = [sourceDir];
-
-  let storage: Storage;
-  if (backend === "memory") {
-    storage = new MemoryStorage();
-  } else {
-    const rootDir = await Deno.makeTempDir({ prefix: "ocfl-root-" });
-    dirs.push(rootDir);
-    storage = new LocalStorage(rootDir);
-  }
-
-  const { root } = await initStorageRoot(storage, { layout: HASHED_N_TUPLE });
-  return {
-    root,
-    async source(name, contents) {
-      const path = `${sourceDir}/${name}`;
-      await Deno.writeTextFile(path, contents);
-      return path;
-    },
-    async cleanup() {
-      for (const dir of dirs) {
-        await Deno.remove(dir, { recursive: true }).catch(() => {});
-      }
-    },
-  };
-}
-
-/** Register one test per backend. */
-function forEachBackend(
-  name: string,
-  run: (harness: Harness) => Promise<void>,
-): void {
-  for (const backend of ["memory", "local"] as const) {
-    Deno.test(`${name} (${backend})`, async () => {
-      const context = await harness(backend);
-      try {
-        await run(context);
-      } finally {
-        await context.cleanup();
-      }
-    });
-  }
-}
 
 /** Plan and commit in one step, with the required provenance filled in. */
 async function commit(

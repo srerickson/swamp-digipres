@@ -7,10 +7,12 @@ a local filesystem or an S3-compatible object store.
   layout extension config
 - `list` — index every object in the root, writing one resource per object
 - `get` — resolve one object's logical paths to the content files holding them
+- `export` — stage one object's content in a local directory, verified on the
+  way past
 - `create_version` — create a new version of an object, creating the object
   itself when it does not exist yet
 
-Validation and content download are deliberately **not** implemented yet.
+Validation is deliberately **not** implemented yet.
 
 ## Storage backends
 
@@ -110,6 +112,65 @@ directly; otherwise every object root is scanned. Either way the inventory's own
 `id` is checked against the requested one — the path is never taken as proof of
 identity.
 
+### `export`
+
+Copies an object's content out of the storage root and onto local disk, which is
+what lets an external tool — a characterisation utility, a format migrator, a
+third-party fixity checker — see the bytes at all. It is the only way to get
+content out; `get` reports content _paths_, which are relative to an object root
+that may not be on a filesystem.
+
+```bash
+swamp model method run my-repo export \
+  --arg id=urn:example:object-1 \
+  --arg dest=/work/staging/object-1
+```
+
+**`dest` is a directory, and it is the base the object's logical paths hang
+off.** It must be absolute, and it is created if it does not exist. A logical
+path of `images/001.jpg` lands at `/work/staging/object-1/images/001.jpg`,
+subdirectories reconstructed. That is true with and without `only`:
+
+```bash
+# Still lands at <dest>/images/001.jpg, not <dest>/001.jpg
+swamp model method run my-repo export \
+  --arg id=urn:example:object-1 \
+  --arg dest=/work/staging/object-1 \
+  --arg only=images/001.jpg
+```
+
+One rule for both cases, and because `dest` is a base rather than a filename,
+two logical paths can never contend for the same destination — there is no
+collision rule to think about. `only` takes one exact logical path; naming one
+the version does not hold is an error rather than a silent zero-file success.
+`version` selects a non-head version and defaults to head.
+
+Files are downloaded `concurrency` at a time (4 by default), which is what makes
+an object of many small files bearable on S3, where the round trip dominates.
+
+#### What it guarantees
+
+**Every file is verified**, unconditionally — there is no opt-out, because the
+bytes pass through the hash on their way to disk anyway. A file is streamed to a
+sibling temp path and renamed into place only once its digest matches the
+manifest. A mismatch fails with `E092` and leaves _nothing_ at the destination,
+so a partially written or corrupted file is never mistaken for content.
+
+**Re-running is cheap and idempotent.** A destination file that already digests
+to the expected value is left untouched and reported as `existing`; one whose
+bytes differ is overwritten. Re-staging a large object costs local hashing
+rather than a second transfer.
+
+**Deduplicated content is fetched once.** Two logical paths sharing a digest
+share one content file, so the bytes are read from storage once and the
+duplicate becomes a local copy — reported as `copied`.
+
+There is **no rollback**. Unlike a half-written OCFL version, a partly populated
+staging directory is not invalid, and `dest` may hold files this run did not put
+there — so a failure leaves what it already placed, reports how far it got, and
+writes no `export` resource. Re-running picks up where it left off, since
+everything already present is skipped.
+
 ### `create_version`
 
 Creating an object and updating one are the same operation in OCFL: both mean
@@ -169,12 +230,11 @@ version's content path, and a `rename` transfers no bytes.
 The write order is not negotiable: conformance declaration first for a new
 object, then content, then `vN/inventory.json` and its sidecar, then the root
 inventory and — as the single commit point — the root sidecar, with nothing
-between those last two. Sources
-are digested at plan time and re-verified as they are written, so a source that
-changed in between is a fatal error rather than a silent substitution. The root
-inventory is re-read immediately before the commit and compared against the
-digest seen at plan time; OCFL has no locking, so this is what stands between a
-concurrent writer and a lost version.
+between those last two. Sources are digested at plan time and re-verified as
+they are written, so a source that changed in between is a fatal error rather
+than a silent substitution. The root inventory is re-read immediately before the
+commit and compared against the digest seen at plan time; OCFL has no locking,
+so this is what stands between a concurrent writer and a lost version.
 
 A failure anywhere before the commit point rolls back, removing only paths under
 the target version directory — and the object root itself only when this call
@@ -206,13 +266,28 @@ uploads: this code aborts its own failures, but a killed process cannot.
 | -------- | --------------------------------- | ----------------------------------------------------- |
 | `root`   | `root`                            | Backend, location, spec version, layout, object count |
 | `object` | `object-<sanitized-id>-<digest8>` | Versions, and the resolved state at one version       |
+| `export` | `export-<sanitized-id>-<digest8>` | Where each logical path was staged, and its digest    |
 
 `create_version` writes the same `object` resource as `get`, re-read from
 storage after the commit rather than reported from the plan — so the resource
 reflects an object that actually parses and verifies against its sidecar.
 
 Instance names become storage paths, so ids are sanitized. Sanitization is
-lossy, so a digest suffix keeps the mapping injective.
+lossy, so a digest suffix keeps the mapping injective. For `export` that suffix
+covers the destination as well as the id: re-exporting to the same directory
+updates one manifest in place, while staging the same object in two directories
+yields two resources rather than one silently replacing the other.
+
+An `export` resource is what makes staged content addressable from a workflow —
+a downstream step reads `destPath` out of `files` rather than reconstructing it:
+
+```
+${{ data.latest("my-repo", "export-...").attributes.files[0].destPath }}
+```
+
+Each entry records `logicalPath`, `destPath`, `digest`, `size`, `verified`, and
+a `source` of `fetched`, `existing` (already on disk with the right bytes), or
+`copied` (deduplicated from a sibling).
 
 ## Development
 
@@ -229,6 +304,11 @@ seeded from the same fixture — if a test passes on both, the OCFL code genuine
 does not depend on the backend. `testdata/fixtures/ocfl-root` is real
 `ocfl-tools` output and is never mutated; tests that write use
 `Deno.makeTempDir()`.
+
+`lib/testing.ts` holds the disposable-storage-root harness the write-path tests
+share. It is test-only and unreachable from `mod.ts`, so it never enters the
+bundle, and its name does not match Deno's test-file patterns, so importing it
+does not register anybody else's tests twice.
 
 `commit_test.ts` asserts through the _read_ path: every write is verified by
 re-opening the object with `openObjectAt` / `readInventory` / `resolveState`

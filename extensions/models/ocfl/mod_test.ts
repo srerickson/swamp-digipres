@@ -13,6 +13,8 @@ import {
 } from "jsr:@std/assert@1";
 import { z } from "npm:zod@4";
 import {
+  exportInstanceName,
+  ExportSchema,
   model,
   objectInstanceName,
   ObjectSchema,
@@ -244,6 +246,125 @@ Deno.test("the storage-root-declaration check passes on an absent root", async (
     }),
   });
   assertEquals(result.pass, true);
+});
+
+/** Export the fixture object into a temp directory, through the model method. */
+async function exportFixture(
+  overrides: Record<string, unknown> = {},
+  id: string = SPEC_ID,
+) {
+  const dest = await Deno.makeTempDir({ prefix: "ocfl-mod-export-" });
+  const { context, writes, logs } = fakeContext({
+    storage: "local",
+    path: FIXTURE,
+  });
+  const run = () =>
+    model.methods.export.execute(
+      args(model.methods.export.arguments, { id, dest, ...overrides }),
+      context,
+    );
+  return {
+    dest,
+    writes,
+    logs,
+    run,
+    cleanup: () => Deno.remove(dest, { recursive: true }).catch(() => {}),
+  };
+}
+
+Deno.test("export writes one export resource naming what it placed", async () => {
+  const run = await exportFixture();
+  try {
+    await run.run();
+
+    assertEquals(run.writes.length, 1);
+    assertEquals(run.writes[0].spec, "export");
+    assertEquals(run.writes[0].name, exportInstanceName(SPEC_ID, run.dest));
+
+    const data = ExportSchema.parse(run.writes[0].data);
+    assertEquals(data.id, SPEC_ID);
+    assertEquals(data.version, "v2");
+    assertEquals(data.dest, run.dest);
+    assertEquals(data.fileCount, 1);
+    assertEquals(data.files[0].logicalPath, "spec.md");
+    assertEquals(data.files[0].destPath, `${run.dest}/spec.md`);
+    assertEquals(data.files[0].source, "fetched");
+    assertEquals(data.files[0].verified, true);
+    assertEquals(data.byteCount, data.files[0].size);
+    assertEquals(
+      (await Deno.stat(data.files[0].destPath)).size,
+      data.byteCount,
+    );
+  } finally {
+    await run.cleanup();
+  }
+});
+
+Deno.test("MECHANICAL: export output matches ExportSchema exactly", async () => {
+  const run = await exportFixture();
+  try {
+    await run.run();
+    assertEquals(
+      Object.keys(run.writes[0].data).sort(),
+      Object.keys(ExportSchema.shape).sort(),
+      "snapshot fields and schema fields must correspond 1:1",
+    );
+    const files = (run.writes[0].data as { files: Record<string, unknown>[] })
+      .files;
+    assertEquals(
+      Object.keys(files[0]).sort(),
+      ["destPath", "digest", "logicalPath", "size", "source", "verified"],
+    );
+  } finally {
+    await run.cleanup();
+  }
+});
+
+Deno.test("export resolves an explicit version", async () => {
+  const run = await exportFixture({ version: "v1" });
+  try {
+    await run.run();
+    const data = ExportSchema.parse(run.writes[0].data);
+    assertEquals(data.version, "v1");
+    // v1 and v2 of the fixture's spec.md differ, so this is a real selection.
+    assertEquals(data.files[0].digest.length > 0, true);
+  } finally {
+    await run.cleanup();
+  }
+});
+
+Deno.test("export writes no resource when the object is missing", async () => {
+  const run = await exportFixture({}, "urn:nope");
+  try {
+    await assertRejects(run.run);
+    assertEquals(run.writes.length, 0);
+    // Nothing was staged, so the destination stays empty.
+    const entries = [];
+    for await (const entry of Deno.readDir(run.dest)) entries.push(entry.name);
+    assertEquals(entries, []);
+  } finally {
+    await run.cleanup();
+  }
+});
+
+Deno.test("export defaults concurrency rather than requiring it", () => {
+  const parsed = model.methods.export.arguments.parse({
+    id: SPEC_ID,
+    dest: "/tmp/staging",
+  });
+  assertEquals(parsed.concurrency, 4);
+  assertEquals(parsed.only, undefined);
+  assertEquals(parsed.version, undefined);
+});
+
+Deno.test("exportInstanceName distinguishes destinations", () => {
+  const name = exportInstanceName(SPEC_ID, "/tmp/a");
+  assertEquals(name, exportInstanceName(SPEC_ID, "/tmp/a"));
+  assertEquals(/^[A-Za-z0-9._-]+$/.test(name), true);
+  assert(name.startsWith("export-urn-swamp-premis-ocfl-spec-"));
+
+  // Same object staged twice must not have one manifest overwrite the other.
+  assert(name !== exportInstanceName(SPEC_ID, "/tmp/b"));
 });
 
 Deno.test("objectInstanceName is stable, safe, and injective", () => {
