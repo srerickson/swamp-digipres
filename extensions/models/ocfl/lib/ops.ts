@@ -1,10 +1,14 @@
 /**
- * The operation language that describes a new version's logical state.
+ * The operations that describe a new version's logical state.
  *
  * A caller does not supply a file listing; it supplies edits against the
- * previous version's state — `add:<source>:<logical>`, `remove:<logical>`,
- * `rename:<from>:<to>`. Folding those edits in order is what produces the state
- * the new version records.
+ * previous version's state — `add`, `remove`, `rename`. Folding those edits in
+ * order is what produces the state the new version records.
+ *
+ * Operations are structured objects rather than a delimited string syntax. That
+ * is the form a swamp workflow can build directly, and it removes the class of
+ * bug where a path containing the delimiter is silently mis-split and content
+ * is deposited somewhere other than where it was asked to go.
  *
  * Nothing here touches storage or computes a digest. Parsing, folding, and path
  * validation all happen before the first byte is written, so a malformed
@@ -12,111 +16,102 @@
  *
  * @module
  */
+import { z } from "npm:zod@4";
 import { OcflError } from "./errors.ts";
 
-/** One edit against the previous version's logical state. */
-export type VersionOp =
-  | { op: "add"; source: string; logicalPath: string }
-  | { op: "remove"; logicalPath: string }
-  | { op: "rename"; from: string; to: string };
+/**
+ * An operand naming a path. Never empty: an empty operand is always a caller
+ * mistake, and accepting one as a path would put content at the object root.
+ */
+const Operand = z.string().min(1);
+
+/**
+ * One edit against the previous version's logical state.
+ *
+ * `.strict()` on every member is load-bearing rather than tidiness. A
+ * misspelled key that fell through would leave its operand undefined, and an
+ * `add` missing its `logicalPath` is exactly the "content in the wrong place"
+ * failure this format exists to prevent. Unknown keys are refused instead.
+ */
+export const OpObjectSchema = z.discriminatedUnion("op", [
+  z.object({
+    op: z.literal("add"),
+    source: Operand,
+    logicalPath: Operand,
+  }).strict(),
+  z.object({
+    op: z.literal("remove"),
+    logicalPath: Operand,
+  }).strict(),
+  z.object({
+    op: z.literal("rename"),
+    from: Operand,
+    to: Operand,
+  }).strict(),
+]);
+
+/**
+ * One edit against the previous version's logical state.
+ *
+ * Derived from {@linkcode OpObjectSchema} so the runtime schema and the type
+ * are a single definition and cannot drift apart.
+ */
+export type VersionOp = z.infer<typeof OpObjectSchema>;
+
+/**
+ * Every form the operation list may arrive in.
+ *
+ * A bare object is the single-operation convenience. swamp's
+ * `--input key=value` does not accumulate repeated keys, so a list arrives
+ * either as `ops:json=[…]` or as a YAML list via `--input-file`.
+ */
+export const OpsInputSchema = z.union([
+  OpObjectSchema,
+  z.array(OpObjectSchema),
+]);
+
+/** Accepted shape of the operation list, before validation. */
+export type OpsInput = z.infer<typeof OpsInputSchema>;
 
 /** Logical path → digest. The working state ops are folded over. */
 export type LogicalState = Map<string, string>;
 
-/** Operands each verb takes, after the verb itself. */
-const ARITY: Record<string, number> = { add: 2, remove: 1, rename: 2 };
-
 /**
- * Split on unescaped `:`, honoring `\:` as a literal colon.
+ * Validate one operation.
  *
- * Logical paths rarely contain colons, but "rarely" is not "never" and a
- * silently mis-split path would deposit content at the wrong place.
+ * Failures surface as {@linkcode OcflError} rather than as a `ZodError`, which
+ * is the contract every caller in this library relies on.
  */
-export function splitOp(text: string): string[] {
-  const fields: string[] = [];
-  let current = "";
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (character === "\\" && index + 1 < text.length) {
-      const next = text[index + 1];
-      // Only `\:` and `\\` are escapes; anything else keeps its backslash, so
-      // a Windows-style path is not silently mangled.
-      if (next === ":" || next === "\\") {
-        current += next;
-        index += 1;
-        continue;
-      }
-      current += character;
-      continue;
-    }
-    if (character === ":") {
-      fields.push(current);
-      current = "";
-      continue;
-    }
-    current += character;
-  }
-  fields.push(current);
-  return fields;
+function parseOp(value: unknown): VersionOp {
+  const parsed = OpObjectSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+
+  const issues = parsed.error.issues
+    .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+    .join("; ");
+  throw new OcflError(
+    `invalid operation ${JSON.stringify(value)}: ${issues}`,
+  );
 }
 
 /**
  * Parse the operation list.
  *
- * Accepts an array of op strings or a single newline-delimited string, because
- * swamp's `--input key=value` does not accumulate repeated keys — a list
- * arrives either as `ops:json=[…]`, as a YAML list via `--input-file`, or as
- * one multi-line string.
+ * Accepts one operation or an array of them.
  *
- * @throws {OcflError} when an op has an unknown verb or the wrong arity.
+ * @throws {OcflError} when the list is empty or any operation is malformed.
  */
-export function parseOps(input: string[] | string): VersionOp[] {
-  const lines = (Array.isArray(input) ? input : input.split("\n"))
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+export function parseOps(input: OpsInput): VersionOp[] {
+  const items = Array.isArray(input) ? input : [input];
 
-  if (lines.length === 0) {
+  if (items.length === 0) {
     throw new OcflError(
       "no operations given; a version must be described by at least one " +
         "add, remove, or rename",
     );
   }
 
-  return lines.map((line) => {
-    const fields = splitOp(line);
-    const verb = fields[0];
-    const operands = fields.slice(1);
-    const arity = ARITY[verb];
-
-    if (arity === undefined) {
-      throw new OcflError(
-        `unknown operation ${JSON.stringify(verb)} in ${
-          JSON.stringify(line)
-        }; ` +
-          `expected one of ${Object.keys(ARITY).join(", ")}`,
-      );
-    }
-    if (operands.length !== arity) {
-      throw new OcflError(
-        `operation ${JSON.stringify(line)} takes ${arity} operand(s) but got ` +
-          `${operands.length}; escape a literal colon as '\\:'`,
-      );
-    }
-    if (operands.some((operand) => operand.length === 0)) {
-      throw new OcflError(
-        `operation ${JSON.stringify(line)} has an empty operand`,
-      );
-    }
-
-    switch (verb) {
-      case "add":
-        return { op: "add", source: operands[0], logicalPath: operands[1] };
-      case "remove":
-        return { op: "remove", logicalPath: operands[0] };
-      default:
-        return { op: "rename", from: operands[0], to: operands[1] };
-    }
-  });
+  return items.map(parseOp);
 }
 
 /** Source paths every `add` in the list refers to, in order, deduplicated. */

@@ -15,11 +15,18 @@ import { digestBytes } from "./digest.ts";
 import { OcflError } from "./errors.ts";
 import { planExport, runExport } from "./export.ts";
 import { findObject } from "./object.ts";
+import type { VersionOp } from "./ops.ts";
 import { openStorageRoot, type StorageRoot } from "./root.ts";
 import { LocalStorage } from "./storage/local.ts";
 import type { Bytes, Entry, Storage } from "./storage/types.ts";
 import { joinPath } from "./storage/types.ts";
-import { commit as commitTo, forEachBackend, type Harness } from "./testing.ts";
+import {
+  addOp,
+  commit as commitTo,
+  forEachBackend,
+  type Harness,
+  removeOp,
+} from "./testing.ts";
 
 const ID = "urn:example:export-1";
 
@@ -29,7 +36,7 @@ const FIXTURE =
 /** Commit a version, against this file's object. */
 function commit(
   root: StorageRoot,
-  ops: string[],
+  ops: VersionOp[],
   options: Record<string, unknown> = {},
 ) {
   return commitTo(root, ID, ops, options);
@@ -111,9 +118,9 @@ forEachBackend(
   "exports a whole version, reconstructing nested logical paths",
   async ({ root, source, scratch }) => {
     await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
-      `add:${await source("c.txt", "charlie")}:docs/deep/c.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "docs/b.txt"),
+      addOp(await source("c.txt", "charlie"), "docs/deep/c.txt"),
     ]);
 
     const dest = await scratch();
@@ -145,8 +152,8 @@ forEachBackend(
   "only exports one logical path, at its full logical path",
   async ({ root, source, scratch }) => {
     await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "docs/b.txt"),
     ]);
 
     const dest = await scratch();
@@ -163,9 +170,9 @@ forEachBackend(
   "only exports several logical paths, in state order",
   async ({ root, source, scratch }) => {
     await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
-      `add:${await source("c.txt", "charlie")}:docs/deep/c.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "docs/b.txt"),
+      addOp(await source("c.txt", "charlie"), "docs/deep/c.txt"),
     ]);
 
     const dest = await scratch();
@@ -188,8 +195,8 @@ forEachBackend(
   "a path asked for twice is exported once",
   async ({ root, source, scratch }) => {
     await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "docs/b.txt"),
     ]);
 
     const dest = await scratch();
@@ -206,9 +213,9 @@ forEachBackend(
     const { root, source, scratch } = harness;
     const identical = "identical bytes";
     await commit(root, [
-      `add:${await source("one.txt", identical)}:one.txt`,
-      `add:${await source("two.txt", identical)}:copies/two.txt`,
-      `add:${await source("three.txt", "other")}:three.txt`,
+      addOp(await source("one.txt", identical), "one.txt"),
+      addOp(await source("two.txt", identical), "copies/two.txt"),
+      addOp(await source("three.txt", "other"), "three.txt"),
     ]);
 
     const dest = await scratch();
@@ -230,7 +237,7 @@ forEachBackend(
 forEachBackend(
   "only naming a path the version does not hold is an error",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const dest = await scratch();
 
     const error = await assertRejects(
@@ -247,7 +254,7 @@ forEachBackend(
 forEachBackend(
   "the error names every missing path, not just the first",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const dest = await scratch();
 
     const error = await assertRejects(
@@ -268,7 +275,7 @@ forEachBackend(
 forEachBackend(
   "an empty selection is rejected rather than read as the whole state",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const dest = await scratch();
 
     // A computed list that came back empty is a caller's bug, not a request to
@@ -281,8 +288,8 @@ forEachBackend(
 forEachBackend(
   "exports a non-head version, and head by default",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "first")}:a.txt`]);
-    await commit(root, [`add:${await source("a2.txt", "second")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "first"), "a.txt")]);
+    await commit(root, [addOp(await source("a2.txt", "second"), "a.txt")]);
 
     const head = await scratch();
     await exportTo(root, head);
@@ -297,7 +304,7 @@ forEachBackend(
 forEachBackend(
   "an unknown version is rejected before anything is written",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const dest = await scratch();
 
     await assertRejects(
@@ -315,8 +322,8 @@ forEachBackend(
     // Same bytes at two logical paths: one manifest entry, one content file.
     const identical = "identical bytes";
     await commit(root, [
-      `add:${await source("one.txt", identical)}:one.txt`,
-      `add:${await source("two.txt", identical)}:copies/two.txt`,
+      addOp(await source("one.txt", identical), "one.txt"),
+      addOp(await source("two.txt", identical), "copies/two.txt"),
     ]);
 
     const dest = await scratch();
@@ -344,8 +351,8 @@ forEachBackend(
     const { root, source, scratch } = harness;
     const identical = "identical bytes";
     await commit(root, [
-      `add:${await source("one.txt", identical)}:one.txt`,
-      `add:${await source("two.txt", identical)}:copies/two.txt`,
+      addOp(await source("one.txt", identical), "one.txt"),
+      addOp(await source("two.txt", identical), "copies/two.txt"),
     ]);
 
     const dest = await scratch();
@@ -378,8 +385,8 @@ forEachBackend(
   async ({ root, source, scratch }) => {
     const identical = "identical bytes";
     await commit(root, [
-      `add:${await source("one.txt", identical)}:one.txt`,
-      `add:${await source("two.txt", identical)}:copies/two.txt`,
+      addOp(await source("one.txt", identical), "one.txt"),
+      addOp(await source("two.txt", identical), "copies/two.txt"),
     ]);
 
     const dest = await scratch();
@@ -401,8 +408,8 @@ forEachBackend(
   async ({ root, source, scratch }) => {
     const identical = "identical bytes";
     await commit(root, [
-      `add:${await source("one.txt", identical)}:one.txt`,
-      `add:${await source("two.txt", identical)}:copies/two.txt`,
+      addOp(await source("one.txt", identical), "one.txt"),
+      addOp(await source("two.txt", identical), "copies/two.txt"),
     ]);
 
     const dest = await scratch();
@@ -429,8 +436,8 @@ forEachBackend(
 forEachBackend(
   "a version whose state is empty exports no files",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
-    await commit(root, ["remove:a.txt"]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
+    await commit(root, [removeOp("a.txt")]);
 
     const dest = await scratch();
     const plan = await planExport(root, { id: ID, dest });
@@ -446,7 +453,7 @@ forEachBackend(
 forEachBackend(
   "a directory sitting at a logical file's destination is reported by path",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
 
     const dest = await scratch();
     // Left behind by staging a version where `a.txt` was itself a directory.
@@ -461,7 +468,7 @@ forEachBackend(
 forEachBackend(
   "a destination is one destination however it is spelled",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const dest = await scratch();
 
     // The export resource's instance name digests `plan.dest`, so a trailing
@@ -478,8 +485,8 @@ forEachBackend(
   "a digest mismatch fails and leaves nothing at the destination",
   async ({ root, source, scratch }) => {
     const plan = await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:b.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "b.txt"),
     ]);
 
     // Corrupt one content file behind the inventory's back — exactly what an
@@ -512,8 +519,8 @@ forEachBackend(
   async (harness) => {
     const { root, source, scratch } = harness;
     await commit(root, [
-      `add:${await source("a.txt", "alpha")}:a.txt`,
-      `add:${await source("b.txt", "bravo")}:docs/b.txt`,
+      addOp(await source("a.txt", "alpha"), "a.txt"),
+      addOp(await source("b.txt", "bravo"), "docs/b.txt"),
     ]);
 
     const dest = await scratch();
@@ -543,7 +550,7 @@ forEachBackend(
 forEachBackend(
   "a destination file whose bytes differ is overwritten",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
 
     const dest = await scratch();
     await Deno.writeTextFile(`${dest}/a.txt`, "stale contents");
@@ -558,7 +565,7 @@ forEachBackend(
 forEachBackend(
   "a destination that is a regular file is rejected at plan time",
   async ({ root, source, scratch }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const dir = await scratch();
     const dest = `${dir}/not-a-directory`;
     await Deno.writeTextFile(dest, "occupied");
@@ -575,7 +582,7 @@ forEachBackend(
 forEachBackend(
   "a relative destination is rejected",
   async ({ root, source }) => {
-    await commit(root, [`add:${await source("a.txt", "alpha")}:a.txt`]);
+    await commit(root, [addOp(await source("a.txt", "alpha"), "a.txt")]);
     const error = await assertRejects(
       () => planExport(root, { id: ID, dest: "relative/staging" }),
       OcflError,
@@ -600,10 +607,10 @@ forEachBackend(
 forEachBackend(
   "concurrent downloads preserve manifest order and clean up on failure",
   async ({ root, source, scratch }) => {
-    const ops: string[] = [];
+    const ops: VersionOp[] = [];
     for (let index = 0; index < 12; index += 1) {
       const name = `file-${String(index).padStart(2, "0")}.txt`;
-      ops.push(`add:${await source(name, `contents ${index}`)}:docs/${name}`);
+      ops.push(addOp(await source(name, `contents ${index}`), `docs/${name}`));
     }
     const plan = await commit(root, ops);
 
