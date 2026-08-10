@@ -3,9 +3,10 @@
  *
  * `init` creates a conformant root with a layout extension, `list` indexes
  * every object in it, `get` resolves one object's logical paths to the content
- * files that hold them, and `create_version` deposits a new version — creating
- * the object too when it does not exist yet, since in OCFL those are the same
- * operation. Validation and content download remain out of scope.
+ * files that hold them, `export` stages those bytes on local disk, and
+ * `create_version` deposits a new version — creating the object too when it
+ * does not exist yet, since in OCFL those are the same operation. Validation
+ * remains out of scope.
  *
  * Methods are thin: they parse arguments, call into `lib/`, and map the result
  * onto resources. All OCFL knowledge lives in `lib/`, and everything there
@@ -18,6 +19,13 @@ import { z } from "npm:zod@4";
 import { commitVersion, planVersion, type VersionPlan } from "./lib/commit.ts";
 import { createStorage } from "./lib/config.ts";
 import { digestText } from "./lib/digest.ts";
+import {
+  DEFAULT_CONCURRENCY,
+  type ExportedFile,
+  type ExportPlan,
+  planExport,
+  runExport,
+} from "./lib/export.ts";
 import { contentDirectoryOf, versionNames } from "./lib/inventory.ts";
 import { parseOps } from "./lib/ops.ts";
 import {
@@ -126,19 +134,68 @@ export const ObjectSchema = z.object({
   readAt: z.iso.datetime(),
 });
 
+/** One exported file, as actually placed on disk. */
+const ExportedFileSchema = z.object({
+  logicalPath: z.string(),
+  destPath: z.string(),
+  digest: z.string(),
+  size: z.number().int(),
+  source: z.enum(["fetched", "existing", "copied"]),
+  verified: z.boolean(),
+});
+
 /**
- * Build a storage-safe instance name for an object id.
+ * Manifest of one export. Exported for conformance tests.
+ *
+ * This is what makes an export usable from a workflow: the next step reads
+ * `destPath` from here rather than reconstructing it from `dest` and a logical
+ * path.
+ */
+export const ExportSchema = z.object({
+  id: z.string(),
+  path: z.string(),
+  version: z.string(),
+  dest: z.string(),
+  fileCount: z.number().int(),
+  byteCount: z.number().int(),
+  files: z.array(ExportedFileSchema),
+  exportedAt: z.iso.datetime(),
+});
+
+/**
+ * Build a storage-safe instance name.
  *
  * Ids are URIs but instance names become storage paths, so they are sanitized.
  * Sanitization is lossy — two ids differing only in stripped characters would
  * collide — so a digest suffix makes the mapping injective again.
+ *
+ * @param label Resource-spec prefix, e.g. `"object"`.
+ * @param id Id shown in the name.
+ * @param key Value the digest suffix is taken over. Defaults to `id`.
  */
-export function objectInstanceName(id: string): string {
+function instanceName(label: string, id: string, key: string = id): string {
   const sanitized = id
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
-  return `object-${sanitized}-${digestText(id, "sha256").slice(0, 8)}`;
+  return `${label}-${sanitized}-${digestText(key, "sha256").slice(0, 8)}`;
+}
+
+/** Instance name for an object id. */
+export function objectInstanceName(id: string): string {
+  return instanceName("object", id);
+}
+
+/**
+ * Instance name for one object staged at one destination.
+ *
+ * The digest covers the destination as well as the id, so re-exporting to the
+ * same directory updates its manifest in place while exporting the same object
+ * to two directories yields two resources rather than one silently replacing
+ * the other.
+ */
+export function exportInstanceName(id: string, dest: string): string {
+  return instanceName("export", id, `${id}\n${dest}`);
 }
 
 /** Map an opened object onto the `object` resource shape. */
@@ -169,6 +226,23 @@ export function objectSnapshot(
     }),
     state: resolveState(inventory, version),
     readAt: new Date().toISOString(),
+  };
+}
+
+/** Map a finished export onto the `export` resource shape. */
+export function exportSnapshot(
+  plan: ExportPlan,
+  files: ExportedFile[],
+): z.infer<typeof ExportSchema> {
+  return {
+    id: plan.id,
+    path: plan.objectPath,
+    version: plan.version,
+    dest: plan.dest,
+    fileCount: files.length,
+    byteCount: files.reduce((total, file) => total + file.size, 0),
+    files,
+    exportedAt: new Date().toISOString(),
   };
 }
 
@@ -233,6 +307,24 @@ const GetArgsSchema = z.object({
   ),
 });
 
+const ExportArgsSchema = z.object({
+  id: z.string().min(1).describe("Object id to export content from"),
+  dest: z.string().min(1).describe(
+    "Absolute path to the local directory content is staged in, created if " +
+      "it does not exist. It stands in for the object root: logical paths " +
+      "are reconstructed beneath it, subdirectories and all.",
+  ),
+  version: z.string().optional().describe(
+    "Version to export; defaults to the object's head",
+  ),
+  only: z.string().optional().describe(
+    "Export this one logical path instead of the whole version state. It " +
+      "still lands at its full logical path under 'dest', not at the top.",
+  ),
+  concurrency: z.number().int().min(1).max(64).default(DEFAULT_CONCURRENCY)
+    .describe("Files to download simultaneously"),
+});
+
 const CreateVersionArgsSchema = z.object({
   id: z.string().min(1).describe(
     "Object id. Created if it does not exist yet, otherwise extended.",
@@ -292,6 +384,13 @@ export const model = {
     "object": {
       description: "One OCFL object's versions and resolved content paths",
       schema: ObjectSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "export": {
+      description:
+        "Manifest of one object's content staged in a local directory",
+      schema: ExportSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -461,6 +560,63 @@ export const model = {
           "object",
           objectInstanceName(args.id),
           snapshot,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    export: {
+      description:
+        "Stage one object's content in a local directory, verifying every file as it is written",
+      arguments: ExportArgsSchema,
+      execute: async (
+        args: z.infer<typeof ExportArgsSchema>,
+        context: MethodContext,
+      ) => {
+        const storage = createStorage(context.globalArgs, context.signal);
+        const root = await openStorageRoot(storage);
+        const plan = await planExport(root, {
+          id: args.id,
+          dest: args.dest,
+          version: args.version,
+          only: args.only,
+        });
+
+        context.logger.info(
+          "Exporting {files} file(s) from {id} at {version} to {dest}",
+          {
+            files: plan.entries.length,
+            id: plan.id,
+            version: plan.version,
+            dest: plan.dest,
+          },
+        );
+
+        const files = await runExport(root, plan, {
+          concurrency: args.concurrency,
+          logger: context.logger,
+        });
+
+        const fetched = files.filter((file) => file.source === "fetched");
+        context.logger.info(
+          "Exported {id} at {version} to {dest}: {fetched} file(s) " +
+            "downloaded, {existing} already present, {copied} deduplicated, " +
+            "{bytes} byte(s) on disk",
+          {
+            id: plan.id,
+            version: plan.version,
+            dest: plan.dest,
+            fetched: fetched.length,
+            existing: files.filter((file) => file.source === "existing").length,
+            copied: files.filter((file) => file.source === "copied").length,
+            bytes: files.reduce((total, file) => total + file.size, 0),
+          },
+        );
+
+        const handle = await context.writeResource(
+          "export",
+          exportInstanceName(plan.id, plan.dest),
+          exportSnapshot(plan, files),
         );
         return { dataHandles: [handle] };
       },
